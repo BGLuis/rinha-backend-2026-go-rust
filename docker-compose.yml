@@ -15,6 +15,7 @@ services:
 
   api1:
     image: luiis001/rinha-api-2026:latest
+    pull_policy: always
     volumes:
       - shared_sockets:/tmp/sockets
     environment:
@@ -30,10 +31,11 @@ services:
 
   api2:
     image: luiis001/rinha-api-2026:latest
+    pull_policy: always
     volumes:
       - shared_sockets:/tmp/sockets
     environment:
-      - SOCKET_PATH=/tmp/sockets/api1.sock
+      - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOGC=1000
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
