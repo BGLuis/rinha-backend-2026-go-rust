@@ -7,9 +7,6 @@ services:
       - shared_sockets:/tmp/sockets
     ports:
       - "9999:9999"
-    depends_on:
-      - api1
-      - api2
     deploy:
       resources:
         limits:
@@ -17,7 +14,7 @@ services:
           memory: '30M'
 
   api1:
-    build: .
+    image: luiis001/rinha-api-2026:latest
     volumes:
       - shared_sockets:/tmp/sockets
     environment:
@@ -32,11 +29,11 @@ services:
           memory: '160M'
 
   api2:
-    build: .
+    image: luiis001/rinha-api-2026:latest
     volumes:
       - shared_sockets:/tmp/sockets
     environment:
-      - SOCKET_PATH=/tmp/sockets/api2.sock
+      - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOGC=1000
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
