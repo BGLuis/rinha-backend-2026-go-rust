@@ -11,6 +11,7 @@ int32_t search(const float* query);
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"net"
@@ -73,6 +74,35 @@ func clamp(v float64) float64 {
 	return v
 }
 
+func parseRFC3339(b []byte) (hour int, weekday int, unix int64) {
+	if len(b) < 19 {
+		return 0, 0, 0
+	}
+	y := int(b[0]-'0')*1000 + int(b[1]-'0')*100 + int(b[2]-'0')*10 + int(b[3]-'0')
+	m := int(b[5]-'0')*10 + int(b[6]-'0')
+	d := int(b[8]-'0')*10 + int(b[9]-'0')
+	hour = int(b[11]-'0')*10 + int(b[12]-'0')
+	min := int(b[14]-'0')*10 + int(b[15]-'0')
+	sec := int(b[17]-'0')*10 + int(b[18]-'0')
+
+	unix = fastUnix(y, m, d, hour, min, sec)
+	weekday = int((unix/86400 + 4) % 7)
+	return hour, weekday, unix
+}
+
+func fastUnix(year, month, day, hour, min, sec int) int64 {
+	y := int64(year)
+	m := int64(month)
+	d := int64(day)
+	cumDays := [13]int64{0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}
+	yearDays := (y-1970)*365 + (y-1969)/4 - (y-1901)/100 + (y-1601)/400
+	res := yearDays + cumDays[m] + d - 1
+	if m > 2 && (y%4 == 0 && (y%100 != 0 || y%400 == 0)) {
+		res++
+	}
+	return res*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
+}
+
 func fastHandler(ctx *fasthttp.RequestCtx) {
 	start := time.Now()
 	path := ctx.Path()
@@ -84,83 +114,115 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 	if string(path) == "/fraud-score" && ctx.IsPost() {
 		body := ctx.PostBody()
 
+		var (
+			amt float64
+			inst int64
+			cAvgAmt float64
+			reqAtStr []byte
+			lastTsStr []byte
+			kmLast float64 = -1
+			kmHome float64
+			txCount int64
+			isOnline bool
+			cardPresent bool
+			merchantId []byte
+			mccStr []byte
+			mAvgAmt float64
+			knownMerchantsVal []byte
+		)
+
+		paths := [][]string{
+			{"transaction", "amount"},
+			{"transaction", "installments"},
+			{"transaction", "requested_at"},
+			{"customer", "avg_amount"},
+			{"customer", "tx_count_24h"},
+			{"customer", "known_merchants"},
+			{"last_transaction", "timestamp"},
+			{"last_transaction", "km_from_current"},
+			{"terminal", "km_from_home"},
+			{"terminal", "is_online"},
+			{"terminal", "card_present"},
+			{"merchant", "id"},
+			{"merchant", "mcc"},
+			{"merchant", "avg_amount"},
+		}
+
+		jsonparser.EachKey(body, func(idx int, value []byte, vt jsonparser.ValueType, err error) {
+			switch idx {
+			case 0: amt, _ = jsonparser.ParseFloat(value)
+			case 1: inst, _ = jsonparser.ParseInt(value)
+			case 2: reqAtStr = value
+			case 3: cAvgAmt, _ = jsonparser.ParseFloat(value)
+			case 4: txCount, _ = jsonparser.ParseInt(value)
+			case 5: knownMerchantsVal = value
+			case 6: lastTsStr = value
+			case 7: kmLast, _ = jsonparser.ParseFloat(value)
+			case 8: kmHome, _ = jsonparser.ParseFloat(value)
+			case 9: isOnline, _ = jsonparser.ParseBoolean(value)
+			case 10: cardPresent, _ = jsonparser.ParseBoolean(value)
+			case 11: merchantId = value
+			case 12: mccStr = value
+			case 13: mAvgAmt, _ = jsonparser.ParseFloat(value)
+			}
+		}, paths...)
+
+		reqHour, reqWeekday, reqUnix := parseRFC3339(reqAtStr)
+
 		var vector [14]float32
 
-		amt, _ := jsonparser.GetFloat(body, "transaction", "amount")
 		vector[0] = float32(clamp(amt / MaxAmount))
-
-		inst, _ := jsonparser.GetInt(body, "transaction", "installments")
 		vector[1] = float32(clamp(float64(inst) / MaxInstallments))
-
-		cAvgAmt, _ := jsonparser.GetFloat(body, "customer", "avg_amount")
 		vector[2] = float32(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
+		vector[3] = float32(float64(reqHour) / 23.0)
+		vector[4] = float32(float64((reqWeekday+6)%7) / 6.0)
 
-		reqAtStr, _ := jsonparser.GetString(body, "transaction", "requested_at")
-		reqAt, _ := time.Parse(time.RFC3339, reqAtStr)
-		reqAt = reqAt.UTC()
-		vector[3] = float32(float64(reqAt.Hour()) / 23.0)
-		vector[4] = float32(float64((int(reqAt.Weekday())+6)%7) / 6.0)
-
-		lastTx, _, _, _ := jsonparser.Get(body, "last_transaction")
-		if lastTx == nil {
+		if lastTsStr == nil {
 			vector[5] = -1.0
 			vector[6] = -1.0
 		} else {
-			lastTsStr, _ := jsonparser.GetString(lastTx, "timestamp")
-			lastTs, _ := time.Parse(time.RFC3339, lastTsStr)
-			lastTs = lastTs.UTC()
-			diffSeconds := reqAt.Unix() - lastTs.Unix()
-			minutes := float64(diffSeconds / 60)
+			_, _, lastUnix := parseRFC3339(lastTsStr)
+			minutes := float64(reqUnix-lastUnix) / 60.0
 			vector[5] = float32(clamp(minutes / MaxMinutes))
-
-			kmLast, _ := jsonparser.GetFloat(lastTx, "km_from_current")
 			vector[6] = float32(clamp(kmLast / MaxKm))
 		}
 
-		kmHome, _ := jsonparser.GetFloat(body, "terminal", "km_from_home")
 		vector[7] = float32(clamp(kmHome / MaxKm))
-
-		txCount, _ := jsonparser.GetInt(body, "customer", "tx_count_24h")
 		vector[8] = float32(clamp(float64(txCount) / MaxTxCount24h))
 
-		isOnline, _ := jsonparser.GetBoolean(body, "terminal", "is_online")
 		if isOnline {
 			vector[9] = 1.0
 		} else {
 			vector[9] = 0.0
 		}
 
-		cardPresent, _ := jsonparser.GetBoolean(body, "terminal", "card_present")
 		if cardPresent {
 			vector[10] = 1.0
 		} else {
 			vector[10] = 0.0
 		}
 
-		merchantId, _ := jsonparser.GetString(body, "merchant", "id")
 		known := false
-		jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-			if dataType == jsonparser.String {
-				val, _ := jsonparser.ParseString(value)
-				if val == merchantId {
-					known = true
+		if knownMerchantsVal != nil {
+			jsonparser.ArrayEach(knownMerchantsVal, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+				if dataType == jsonparser.String {
+					if bytes.Equal(value, merchantId) {
+						known = true
+					}
 				}
-			}
-		}, "customer", "known_merchants")
+			})
+		}
 		if !known {
 			vector[11] = 1.0
 		} else {
 			vector[11] = 0.0
 		}
 
-		mcc, _ := jsonparser.GetString(body, "merchant", "mcc")
-		risk, ok := MccRisk[mcc]
+		risk, ok := MccRisk[string(mccStr)]
 		if !ok {
 			risk = 0.5
 		}
 		vector[12] = float32(risk)
-
-		mAvgAmt, _ := jsonparser.GetFloat(body, "merchant", "avg_amount")
 		vector[13] = float32(clamp(mAvgAmt / MaxMerchantAvgAmount))
 
 		if time.Since(start) > 1800*time.Millisecond {
@@ -170,6 +232,7 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		}
 
 		frauds := C.search((*C.float)(unsafe.Pointer(&vector[0])))
+
 
 		ctx.SetContentType("application/json")
 		switch frauds {

@@ -23,6 +23,9 @@ services:
       - shared_sockets:/tmp/sockets
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
+      - GOGC=1000
+      - GOMEMLIMIT=150MiB
+      - GOMAXPROCS=1
     deploy:
       resources:
         limits:
@@ -35,6 +38,9 @@ services:
       - shared_sockets:/tmp/sockets
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
+      - GOGC=1000
+      - GOMEMLIMIT=150MiB
+      - GOMAXPROCS=1
     deploy:
       resources:
         limits:

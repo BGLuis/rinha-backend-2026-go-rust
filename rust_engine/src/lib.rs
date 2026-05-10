@@ -6,25 +6,31 @@ use memmap2::{Mmap, MmapOptions};
 use std::arch::x86_64::*;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct ClusterHeader {
     centroid: [f32; 14],
+    bbox_min: [i16; 14],
+    bbox_max: [i16; 14],
     radius_sq: f32,
     offset: u32,
     count: u32,
-    _pad: [u8; 12],
-} // 80 bytes
+    _pad: [u8; 4],
+} // 128 bytes
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Point {
-    vector: [f32; 14],
+    vector: [i16; 14],
     index: u32,
     label: u8,
     _pad: [u8; 3],
-} // 64 bytes
+} // 36 bytes
 
 static mut DATASET_MMAP: Option<Mmap> = None;
 static mut CLUSTERS: Option<&'static [ClusterHeader]> = None;
 static mut POINTS: Option<&'static [Point]> = None;
+
+const SCALE: f32 = 10000.0;
 
 #[no_mangle]
 pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
@@ -34,25 +40,20 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
             Ok(s) => s,
             Err(_) => return -1,
         };
-
         let file = match File::open(path) {
             Ok(f) => f,
             Err(_) => return -2,
         };
-
         let mmap = match MmapOptions::new().map(&file) {
             Ok(m) => m,
             Err(_) => return -3,
         };
-        
         let k = *(mmap.as_ptr() as *const u32) as usize;
         let clusters_ptr = mmap.as_ptr().add(64) as *const ClusterHeader;
         CLUSTERS = Some(slice::from_raw_parts(clusters_ptr, k));
-        
-        let points_ptr = mmap.as_ptr().add(64 + k * 80) as *const Point;
-        let num_points = (mmap.len() - (64 + k * 80)) / 64;
+        let points_ptr = mmap.as_ptr().add(64 + k * 128) as *const Point;
+        let num_points = (mmap.len() - (64 + k * 128)) / 36;
         POINTS = Some(slice::from_raw_parts(points_ptr, num_points));
-
         DATASET_MMAP = Some(mmap);
         0
     }
@@ -61,8 +62,23 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
     let q_f32 = slice::from_raw_parts(query_ptr, 14);
-    let mut q_vec = [0.0f32; 16];
-    q_vec[..14].copy_from_slice(q_f32);
+    
+    // Scale query once for integer SIMD using AVX2
+    let mut q_i16 = [0i16; 16];
+    let v_scale = _mm256_set1_ps(SCALE);
+    let q0 = _mm256_loadu_ps(q_f32.as_ptr());
+    let q0_scaled = _mm256_mul_ps(q0, v_scale);
+    let q0_i32 = _mm256_cvtps_epi32(q0_scaled);
+
+    let mut q_rest = [0.0f32; 8];
+    q_rest[..6].copy_from_slice(&q_f32[8..14]);
+    let q1 = _mm256_loadu_ps(q_rest.as_ptr());
+    let q1_scaled = _mm256_mul_ps(q1, v_scale);
+    let q1_i32 = _mm256_cvtps_epi32(q1_scaled);
+
+    let q_packed = _mm256_packs_epi32(q0_i32, q1_i32);
+    let q_ordered = _mm256_permute4x64_epi64(q_packed, 0b11011000);
+    _mm256_storeu_si256(q_i16.as_ptr() as *mut __m256i, q_ordered);
     
     let clusters = CLUSTERS.as_ref().unwrap();
     let points = POINTS.as_ref().unwrap();
@@ -71,59 +87,74 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
     let mut top_indices = [u32::MAX; 5];
     let mut top_labels = [0u8; 5];
 
-    let q0 = _mm256_loadu_ps(q_vec.as_ptr());
-    let q1 = _mm256_loadu_ps(q_vec.as_ptr().add(8));
-    let mask1 = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
+    // Pre-calculate query registers
+    let q0_f32 = _mm256_loadu_ps([
+        q_f32[0], q_f32[1], q_f32[2], q_f32[3], q_f32[4], q_f32[5], q_f32[6], q_f32[7]
+    ].as_ptr());
+    let q1_f32 = _mm256_loadu_ps([
+        q_f32[8], q_f32[9], q_f32[10], q_f32[11], q_f32[12], q_f32[13], 0.0, 0.0
+    ].as_ptr());
+    let mask1_f32 = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
 
-    let mut cluster_dists_sq = Vec::with_capacity(clusters.len());
+    let q_i16_reg = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
+
+    // 1. Candidate Filtering using Float Centroids
+    let mut cluster_candidates = Vec::with_capacity(clusters.len());
     for (i, c) in clusters.iter().enumerate() {
         let mut c_vec = [0.0f32; 16];
         c_vec[..14].copy_from_slice(&c.centroid);
-        
         let n0 = _mm256_loadu_ps(c_vec.as_ptr());
         let n1 = _mm256_loadu_ps(c_vec.as_ptr().add(8));
-        let d0 = _mm256_sub_ps(q0, n0);
-        let d1 = _mm256_sub_ps(q1, n1);
-        let d1m = _mm256_mul_ps(d1, mask1);
+        let d0 = _mm256_sub_ps(q0_f32, n0);
+        let d1 = _mm256_sub_ps(q1_f32, n1);
+        let d1m = _mm256_mul_ps(d1, mask1_f32);
         let s0 = _mm256_mul_ps(d0, d0);
         let s1 = _mm256_fmadd_ps(d1m, d1m, s0);
-        let d2 = hsum_ps_avx(s1) as f64;
-        
-        cluster_dists_sq.push((d2, i));
+        cluster_candidates.push((hsum_ps_avx(s1).sqrt() as f64, i));
     }
-    cluster_dists_sq.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    cluster_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    for (dist_to_centroid_sq, idx) in cluster_dists_sq {
+    // 2. Intra-cluster search with Integer SIMD (NITRO MODE)
+    for (dist_to_centroid, idx) in cluster_candidates {
         let c = &clusters[idx];
         
-        let dist_to_centroid = dist_to_centroid_sq.sqrt();
+        // --- Pruning Step ---
         let radius = (c.radius_sq as f64).sqrt();
         let tau = top_dists_sq[4].sqrt();
         
-        // Exact pruning using triangular inequality
         if dist_to_centroid - radius > tau {
             continue;
         }
+        
+        // Extra tight check: Bounding Box
+        let mut outside_bbox = false;
+        let thresh_i16 = (tau * SCALE as f64).round() as i16;
+        for i in 0..14 {
+            if q_i16[i] < c.bbox_min[i] - thresh_i16 || q_i16[i] > c.bbox_max[i] + thresh_i16 {
+                outside_bbox = true;
+                break;
+            }
+        }
+        if outside_bbox {
+            continue;
+        }
+        // --------------------
 
         let start = c.offset as usize;
         let count = c.count as usize;
+        
         for i in 0..count {
             let p = points.get_unchecked(start + i);
-            let n0 = _mm256_loadu_ps(p.vector.as_ptr());
-            let n1 = _mm256_loadu_ps(p.vector.as_ptr().add(8));
-            let d0 = _mm256_sub_ps(q0, n0);
-            let d1 = _mm256_sub_ps(q1, n1);
-            let d1m = _mm256_mul_ps(d1, mask1);
-            let s0 = _mm256_mul_ps(d0, d0);
-            let s1 = _mm256_fmadd_ps(d1m, d1m, s0);
-            let d2 = hsum_ps_avx(s1) as f64;
+            let p_i16_reg = _mm256_loadu_si256(p.vector.as_ptr() as *const __m256i);
+            let diff = _mm256_sub_epi16(q_i16_reg, p_i16_reg);
+            let sq = _mm256_madd_epi16(diff, diff); 
+            let d2 = hsum_epi32_avx(sq) as f64 / (SCALE as f64 * SCALE as f64);
 
             if d2 < top_dists_sq[4] || (d2 == top_dists_sq[4] && p.index < top_indices[4]) {
                 insert_top5(d2, p.index, p.label, &mut top_dists_sq, &mut top_indices, &mut top_labels);
             }
         }
     }
-
     top_labels.iter().map(|&l| l as i32).sum()
 }
 
@@ -136,6 +167,14 @@ unsafe fn hsum_ps_avx(v: __m256) -> f32 {
 }
 
 #[inline(always)]
+unsafe fn hsum_epi32_avx(v: __m256i) -> i32 {
+    let x128 = _mm_add_epi32(_mm256_extractf128_si256(v, 1), _mm256_castsi256_si128(v));
+    let x64 = _mm_add_epi32(x128, _mm_shuffle_epi32(x128, 0x0E));
+    let x32 = _mm_add_epi32(x64, _mm_shuffle_epi32(x64, 0x01));
+    _mm_cvtsi128_si32(x32)
+}
+
+#[inline(always)]
 fn insert_top5(dist_sq: f64, index: u32, label: u8, dists_sq: &mut [f64; 5], indices: &mut [u32; 5], labels: &mut [u8; 5]) {
     let mut pos = 0;
     while pos < 5 {
@@ -144,7 +183,6 @@ fn insert_top5(dist_sq: f64, index: u32, label: u8, dists_sq: &mut [f64; 5], ind
         }
         pos += 1;
     }
-    
     if pos < 5 {
         for i in (pos+1..5).rev() {
             dists_sq[i] = dists_sq[i-1];
