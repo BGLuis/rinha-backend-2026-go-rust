@@ -11,7 +11,6 @@ int32_t search(const float* query);
 import "C"
 
 import (
-	"bytes"
 	"encoding/json"
 	"log"
 	"net"
@@ -118,15 +117,15 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 			amt float64
 			inst int64
 			cAvgAmt float64
-			reqAtStr []byte
-			lastTsStr []byte
+			reqAtStr string
+			lastTsStr string
 			kmLast float64 = -1
 			kmHome float64
 			txCount int64
 			isOnline bool
 			cardPresent bool
-			merchantId []byte
-			mccStr []byte
+			merchantId string
+			mccStr string
 			mAvgAmt float64
 			knownMerchantsVal []byte
 		)
@@ -152,22 +151,25 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 			switch idx {
 			case 0: amt, _ = jsonparser.ParseFloat(value)
 			case 1: inst, _ = jsonparser.ParseInt(value)
-			case 2: reqAtStr = value
+			case 2: reqAtStr, _ = jsonparser.ParseString(value)
 			case 3: cAvgAmt, _ = jsonparser.ParseFloat(value)
 			case 4: txCount, _ = jsonparser.ParseInt(value)
 			case 5: knownMerchantsVal = value
-			case 6: lastTsStr = value
+			case 6: lastTsStr, _ = jsonparser.ParseString(value)
 			case 7: kmLast, _ = jsonparser.ParseFloat(value)
 			case 8: kmHome, _ = jsonparser.ParseFloat(value)
 			case 9: isOnline, _ = jsonparser.ParseBoolean(value)
 			case 10: cardPresent, _ = jsonparser.ParseBoolean(value)
-			case 11: merchantId = value
-			case 12: mccStr = value
+			case 11: merchantId, _ = jsonparser.ParseString(value)
+			case 12: mccStr, _ = jsonparser.ParseString(value)
 			case 13: mAvgAmt, _ = jsonparser.ParseFloat(value)
 			}
 		}, paths...)
 
-		reqHour, reqWeekday, reqUnix := parseRFC3339(reqAtStr)
+		reqHour, reqWeekday, reqUnix := 0, 0, int64(0)
+		if reqAtStr != "" {
+			reqHour, reqWeekday, reqUnix = parseRFC3339([]byte(reqAtStr))
+		}
 
 		var vector [14]float32
 
@@ -177,11 +179,11 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		vector[3] = float32(float64(reqHour) / 23.0)
 		vector[4] = float32(float64((reqWeekday+6)%7) / 6.0)
 
-		if lastTsStr == nil {
+		if lastTsStr == "" {
 			vector[5] = -1.0
 			vector[6] = -1.0
 		} else {
-			_, _, lastUnix := parseRFC3339(lastTsStr)
+			_, _, lastUnix := parseRFC3339([]byte(lastTsStr))
 			minutes := float64(reqUnix-lastUnix) / 60.0
 			vector[5] = float32(clamp(minutes / MaxMinutes))
 			vector[6] = float32(clamp(kmLast / MaxKm))
@@ -206,7 +208,8 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		if knownMerchantsVal != nil {
 			jsonparser.ArrayEach(knownMerchantsVal, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
 				if dataType == jsonparser.String {
-					if bytes.Equal(value, merchantId) {
+					val, _ := jsonparser.ParseString(value)
+					if val == merchantId {
 						known = true
 					}
 				}
@@ -218,7 +221,7 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 			vector[11] = 0.0
 		}
 
-		risk, ok := MccRisk[string(mccStr)]
+		risk, ok := MccRisk[mccStr]
 		if !ok {
 			risk = 0.5
 		}
@@ -232,7 +235,6 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		}
 
 		frauds := C.search((*C.float)(unsafe.Pointer(&vector[0])))
-
 
 		ctx.SetContentType("application/json")
 		switch frauds {

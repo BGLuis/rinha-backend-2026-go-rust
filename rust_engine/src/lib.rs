@@ -21,10 +21,11 @@ struct ClusterHeader {
 #[derive(Clone, Copy)]
 struct Point {
     vector: [i16; 14],
+    _pad_simd: [i16; 2], // Pad to 16 elements (32 bytes) for safe SIMD load
     index: u32,
     label: u8,
     _pad: [u8; 3],
-} // 36 bytes
+} // 40 bytes
 
 static mut DATASET_MMAP: Option<Mmap> = None;
 static mut CLUSTERS: Option<&'static [ClusterHeader]> = None;
@@ -52,7 +53,7 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         let clusters_ptr = mmap.as_ptr().add(64) as *const ClusterHeader;
         CLUSTERS = Some(slice::from_raw_parts(clusters_ptr, k));
         let points_ptr = mmap.as_ptr().add(64 + k * 128) as *const Point;
-        let num_points = (mmap.len() - (64 + k * 128)) / 36;
+        let num_points = (mmap.len() - (64 + k * 128)) / 40;
         POINTS = Some(slice::from_raw_parts(points_ptr, num_points));
         DATASET_MMAP = Some(mmap);
         0
@@ -63,22 +64,11 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
 pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
     let q_f32 = slice::from_raw_parts(query_ptr, 14);
     
-    // Scale query once for integer SIMD using AVX2
+    // Scale query once for integer SIMD (Simple fallback for reliability)
     let mut q_i16 = [0i16; 16];
-    let v_scale = _mm256_set1_ps(SCALE);
-    let q0 = _mm256_loadu_ps(q_f32.as_ptr());
-    let q0_scaled = _mm256_mul_ps(q0, v_scale);
-    let q0_i32 = _mm256_cvtps_epi32(q0_scaled);
-
-    let mut q_rest = [0.0f32; 8];
-    q_rest[..6].copy_from_slice(&q_f32[8..14]);
-    let q1 = _mm256_loadu_ps(q_rest.as_ptr());
-    let q1_scaled = _mm256_mul_ps(q1, v_scale);
-    let q1_i32 = _mm256_cvtps_epi32(q1_scaled);
-
-    let q_packed = _mm256_packs_epi32(q0_i32, q1_i32);
-    let q_ordered = _mm256_permute4x64_epi64(q_packed, 0b11011000);
-    _mm256_storeu_si256(q_i16.as_ptr() as *mut __m256i, q_ordered);
+    for i in 0..14 {
+        q_i16[i] = (q_f32[i] * SCALE).round() as i16;
+    }
     
     let clusters = CLUSTERS.as_ref().unwrap();
     let points = POINTS.as_ref().unwrap();
@@ -87,13 +77,11 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
     let mut top_indices = [u32::MAX; 5];
     let mut top_labels = [0u8; 5];
 
-    // Pre-calculate query registers
-    let q0_f32 = _mm256_loadu_ps([
-        q_f32[0], q_f32[1], q_f32[2], q_f32[3], q_f32[4], q_f32[5], q_f32[6], q_f32[7]
-    ].as_ptr());
-    let q1_f32 = _mm256_loadu_ps([
-        q_f32[8], q_f32[9], q_f32[10], q_f32[11], q_f32[12], q_f32[13], 0.0, 0.0
-    ].as_ptr());
+    // Pre-calculate query registers for candidate filtering (Float SIMD)
+    let mut q_padded = [0.0f32; 16];
+    q_padded[..14].copy_from_slice(q_f32);
+    let q0_f32 = _mm256_loadu_ps(q_padded.as_ptr());
+    let q1_f32 = _mm256_loadu_ps(q_padded.as_ptr().add(8));
     let mask1_f32 = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
 
     let q_i16_reg = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
@@ -126,17 +114,22 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
             continue;
         }
         
-        // Extra tight check: Bounding Box
-        let mut outside_bbox = false;
-        let thresh_i16 = (tau * SCALE as f64).round() as i16;
-        for i in 0..14 {
-            if q_i16[i] < c.bbox_min[i] - thresh_i16 || q_i16[i] > c.bbox_max[i] + thresh_i16 {
-                outside_bbox = true;
-                break;
+        // Extra tight check: Bounding Box (Using i64 to prevent overflow)
+        if top_dists_sq[4] != f64::MAX {
+            let mut outside_bbox = false;
+            let thresh_i64 = (top_dists_sq[4].sqrt() * SCALE as f64).round() as i64;
+            for i in 0..14 {
+                let q_val = q_i16[i] as i64;
+                let b_min = c.bbox_min[i] as i64;
+                let b_max = c.bbox_max[i] as i64;
+                if q_val < b_min - thresh_i64 || q_val > b_max + thresh_i64 {
+                    outside_bbox = true;
+                    break;
+                }
             }
-        }
-        if outside_bbox {
-            continue;
+            if outside_bbox {
+                continue;
+            }
         }
         // --------------------
 
