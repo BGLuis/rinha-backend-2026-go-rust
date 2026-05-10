@@ -1,0 +1,2 @@
+resources/references.json.gz filter=lfs diff=lfs merge=lfs -text
+test/test-data.json filter=lfs diff=lfs merge=lfs -text

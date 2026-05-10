@@ -1,0 +1,17 @@
+{
+    "participants": [
+        "Luis"
+    ],
+    "social": [
+        "https://github.com/BGLuis"
+    ],
+    "source-code-repo": "https://github.com/BGLuis/rinha-backend-2026-go-rust",
+    "stack": [
+        "go",
+        "rust",
+        "nginx",
+        "docker",
+        "ivf-vector-search"
+    ],
+    "open_to_work": true
+}
