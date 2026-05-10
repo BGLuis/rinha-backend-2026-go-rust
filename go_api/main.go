@@ -23,7 +23,6 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// Constants from normalization.json
 var (
 	MaxAmount             float64
 	MaxInstallments      float64
@@ -44,48 +43,6 @@ var (
 	resp4 = []byte(`{"approved":false,"fraud_score":0.8}`)
 	resp5 = []byte(`{"approved":false,"fraud_score":1.0}`)
 )
-
-func main() {
-	loadConfig()
-
-	datasetPath := os.Getenv("DATASET_PATH")
-	if datasetPath == "" {
-		datasetPath = "./dataset.bin"
-	}
-	cPath := C.CString(datasetPath)
-	res := C.init_engine(cPath)
-	C.free(unsafe.Pointer(cPath))
-	if res != 0 {
-		log.Fatalf("Falha: %d", res)
-	}
-
-	socketPath := os.Getenv("SOCKET_PATH")
-	var listener net.Listener
-	var err error
-
-	if socketPath != "" {
-		_ = os.Remove(socketPath)
-		listener, err = net.Listen("unix", socketPath)
-		if err != nil {
-			log.Fatal(err)
-		}
-		os.Chmod(socketPath, 0777)
-	} else {
-		listener, err = net.Listen("tcp", ":9999")
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	server := &fasthttp.Server{
-		Handler: fastHandler,
-		Name:    "api",
-	}
-
-	if err := server.Serve(listener); err != nil {
-		log.Fatal(err)
-	}
-}
 
 func loadConfig() {
 	normData, _ := os.ReadFile("resources/normalization.json")
@@ -117,10 +74,6 @@ func clamp(v float64) float64 {
 	return v
 }
 
-func round4(v float64) float32 {
-	return float32(math.Round(v*10000) / 10000)
-}
-
 func fastHandler(ctx *fasthttp.RequestCtx) {
 	start := time.Now()
 	path := ctx.Path()
@@ -135,19 +88,19 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		var vector [14]float32
 
 		amt, _ := jsonparser.GetFloat(body, "transaction", "amount")
-		vector[0] = round4(clamp(amt / MaxAmount))
+		vector[0] = float32(clamp(amt / MaxAmount))
 
 		inst, _ := jsonparser.GetInt(body, "transaction", "installments")
-		vector[1] = round4(clamp(float64(inst) / MaxInstallments))
+		vector[1] = float32(clamp(float64(inst) / MaxInstallments))
 
 		cAvgAmt, _ := jsonparser.GetFloat(body, "customer", "avg_amount")
-		vector[2] = round4(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
+		vector[2] = float32(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
 
 		reqAtStr, _ := jsonparser.GetString(body, "transaction", "requested_at")
 		reqAt, _ := time.Parse(time.RFC3339, reqAtStr)
 		reqAt = reqAt.UTC()
-		vector[3] = round4(float64(reqAt.Hour()) / 23.0)
-		vector[4] = round4(float64((int(reqAt.Weekday())+6)%7) / 6.0)
+		vector[3] = float32(float64(reqAt.Hour()) / 23.0)
+		vector[4] = float32(float64((int(reqAt.Weekday())+6)%7) / 6.0)
 
 		lastTx, _, _, _ := jsonparser.Get(body, "last_transaction")
 		if lastTx == nil {
@@ -157,20 +110,19 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 			lastTsStr, _ := jsonparser.GetString(lastTx, "timestamp")
 			lastTs, _ := time.Parse(time.RFC3339, lastTsStr)
 			lastTs = lastTs.UTC()
-			// Usar diferença inteira de segundos para minutos (floor)
 			diffSeconds := reqAt.Unix() - lastTs.Unix()
 			minutes := float64(diffSeconds / 60)
-			vector[5] = round4(clamp(minutes / MaxMinutes))
-		...
+			vector[5] = float32(clamp(minutes / MaxMinutes))
+
 			kmLast, _ := jsonparser.GetFloat(lastTx, "km_from_current")
-			vector[6] = round4(clamp(kmLast / MaxKm))
+			vector[6] = float32(clamp(kmLast / MaxKm))
 		}
 
 		kmHome, _ := jsonparser.GetFloat(body, "terminal", "km_from_home")
-		vector[7] = round4(clamp(kmHome / MaxKm))
+		vector[7] = float32(clamp(kmHome / MaxKm))
 
 		txCount, _ := jsonparser.GetInt(body, "customer", "tx_count_24h")
-		vector[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
+		vector[8] = float32(clamp(float64(txCount) / MaxTxCount24h))
 
 		isOnline, _ := jsonparser.GetBoolean(body, "terminal", "is_online")
 		if isOnline {
@@ -207,10 +159,10 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		if !ok {
 			risk = 0.5
 		}
-		vector[12] = round4(risk)
+		vector[12] = float32(risk)
 
 		mAvgAmt, _ := jsonparser.GetFloat(body, "merchant", "avg_amount")
-		vector[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
+		vector[13] = float32(clamp(mAvgAmt / MaxMerchantAvgAmount))
 
 		if time.Since(start) > 1800*time.Millisecond {
 			ctx.SetContentType("application/json")
@@ -234,4 +186,32 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	ctx.SetStatusCode(404)
+}
+
+func main() {
+	loadConfig()
+
+	cPath := C.CString(os.Getenv("DATASET_PATH"))
+	C.init_engine(cPath)
+	C.free(unsafe.Pointer(cPath))
+
+	socketPath := os.Getenv("SOCKET_PATH")
+	if socketPath == "" {
+		socketPath = "/tmp/sockets/api.sock"
+	}
+	os.Remove(socketPath)
+
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		log.Fatalf("error in net.Listen: %s", err)
+	}
+	os.Chmod(socketPath, 0777)
+
+	s := &fasthttp.Server{
+		Handler: fastHandler,
+	}
+
+	if err := s.Serve(ln); err != nil {
+		log.Fatalf("error in Serve: %s", err)
+	}
 }

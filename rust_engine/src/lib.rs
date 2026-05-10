@@ -17,8 +17,9 @@ struct ClusterHeader {
 #[repr(C)]
 struct Point {
     vector: [f32; 14],
+    index: u32,
     label: u8,
-    _pad: [u8; 7],
+    _pad: [u8; 3],
 } // 64 bytes
 
 static mut DATASET_MMAP: Option<Mmap> = None;
@@ -45,7 +46,6 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         };
         
         let k = *(mmap.as_ptr() as *const u32) as usize;
-        // Align 64
         let clusters_ptr = mmap.as_ptr().add(64) as *const ClusterHeader;
         CLUSTERS = Some(slice::from_raw_parts(clusters_ptr, k));
         
@@ -68,8 +68,8 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
     let points = POINTS.as_ref().unwrap();
 
     let mut top_dists_sq = [f64::MAX; 5];
+    let mut top_indices = [u32::MAX; 5];
     let mut top_labels = [0u8; 5];
-    let mut tau_sq = f64::MAX;
 
     let q0 = _mm256_loadu_ps(q_vec.as_ptr());
     let q1 = _mm256_loadu_ps(q_vec.as_ptr().add(8));
@@ -98,9 +98,10 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
         
         let dist_to_centroid = dist_to_centroid_sq.sqrt();
         let radius = (c.radius_sq as f64).sqrt();
-        let tau = tau_sq.sqrt();
+        let tau = top_dists_sq[4].sqrt();
         
-        if dist_to_centroid - radius >= tau {
+        // Exact pruning using triangular inequality
+        if dist_to_centroid - radius > tau {
             continue;
         }
 
@@ -117,9 +118,8 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
             let s1 = _mm256_fmadd_ps(d1m, d1m, s0);
             let d2 = hsum_ps_avx(s1) as f64;
 
-            if d2 < tau_sq {
-                insert_top5(d2, p.label, &mut top_dists_sq, &mut top_labels);
-                tau_sq = top_dists_sq[4];
+            if d2 < top_dists_sq[4] || (d2 == top_dists_sq[4] && p.index < top_indices[4]) {
+                insert_top5(d2, p.index, p.label, &mut top_dists_sq, &mut top_indices, &mut top_labels);
             }
         }
     }
@@ -136,26 +136,23 @@ unsafe fn hsum_ps_avx(v: __m256) -> f32 {
 }
 
 #[inline(always)]
-fn insert_top5(dist_sq: f64, label: u8, dists_sq: &mut [f64; 5], labels: &mut [u8; 5]) {
-    if dist_sq < dists_sq[0] {
-        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
-        dists_sq[3] = dists_sq[2]; labels[3] = labels[2];
-        dists_sq[2] = dists_sq[1]; labels[2] = labels[1];
-        dists_sq[1] = dists_sq[0]; labels[1] = labels[0];
-        dists_sq[0] = dist_sq; labels[0] = label;
-    } else if dist_sq < dists_sq[1] {
-        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
-        dists_sq[3] = dists_sq[2]; labels[3] = labels[2];
-        dists_sq[2] = dists_sq[1]; labels[2] = labels[1];
-        dists_sq[1] = dist_sq; labels[1] = label;
-    } else if dist_sq < dists_sq[2] {
-        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
-        dists_sq[3] = dists_sq[2]; labels[3] = labels[2];
-        dists_sq[2] = dist_sq; labels[2] = label;
-    } else if dist_sq < dists_sq[3] {
-        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
-        dists_sq[3] = dist_sq; labels[3] = label;
-    } else if dist_sq < dists_sq[4] {
-        dists_sq[4] = dist_sq; labels[4] = label;
+fn insert_top5(dist_sq: f64, index: u32, label: u8, dists_sq: &mut [f64; 5], indices: &mut [u32; 5], labels: &mut [u8; 5]) {
+    let mut pos = 0;
+    while pos < 5 {
+        if dist_sq < dists_sq[pos] || (dist_sq == dists_sq[pos] && index < indices[pos]) {
+            break;
+        }
+        pos += 1;
+    }
+    
+    if pos < 5 {
+        for i in (pos+1..5).rev() {
+            dists_sq[i] = dists_sq[i-1];
+            indices[i] = indices[i-1];
+            labels[i] = labels[i-1];
+        }
+        dists_sq[pos] = dist_sq;
+        indices[pos] = index;
+        labels[pos] = label;
     }
 }
