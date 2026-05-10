@@ -1,0 +1,1 @@
+# rinha-backend-2026-go-rust
