@@ -12,7 +12,6 @@ import "C"
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"math"
 	"net"
