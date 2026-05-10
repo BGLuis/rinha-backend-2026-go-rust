@@ -1,8 +1,9 @@
-.PHONY: build up down restart logs smoke test
+.PHONY: build up down restart logs smoke test docker-push
 
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
 PWD = $(shell pwd)
+IMAGE_NAME = bgluis/rinha-api-2026:latest
 
 build:
 	$(DOCKER_COMPOSE) build
@@ -24,6 +25,10 @@ smoke:
 
 test:
 	docker run --rm --network host -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/test.js
+
+docker-push:
+	docker build -t $(IMAGE_NAME) .
+	docker push $(IMAGE_NAME)
 
 run-all: restart
 	sleep 5
