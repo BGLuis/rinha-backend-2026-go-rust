@@ -3,7 +3,7 @@
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
 PWD = $(shell pwd)
-IMAGE_NAME = bgluis/rinha-api-2026:latest
+IMAGE_NAME = luiis001/rinha-api-2026:latest
 
 build:
 	$(DOCKER_COMPOSE) build
