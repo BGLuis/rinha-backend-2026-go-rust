@@ -3,13 +3,27 @@ use std::fs::File;
 use std::os::raw::c_char;
 use std::slice;
 use memmap2::{Mmap, MmapOptions};
+use std::arch::x86_64::*;
+
+#[repr(C)]
+struct ClusterHeader {
+    centroid: [f32; 14],
+    radius_sq: f32,
+    offset: u32,
+    count: u32,
+    _pad: [u8; 12],
+} // 80 bytes
+
+#[repr(C)]
+struct Point {
+    vector: [f32; 14],
+    label: u8,
+    _pad: [u8; 7],
+} // 64 bytes
 
 static mut DATASET_MMAP: Option<Mmap> = None;
-static mut NUM_CLUSTERS: u32 = 0;
-static mut CENTROIDS: Option<&'static [i16]> = None;
-static mut OFFSETS: Option<&'static [(u32, u32)]> = None;
-
-const RECORD_SIZE: usize = 32;
+static mut CLUSTERS: Option<&'static [ClusterHeader]> = None;
+static mut POINTS: Option<&'static [Point]> = None;
 
 #[no_mangle]
 pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
@@ -30,18 +44,14 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
             Err(_) => return -3,
         };
         
-        let mmap_ptr = mmap.as_ptr();
+        let k = *(mmap.as_ptr() as *const u32) as usize;
+        // Align 64
+        let clusters_ptr = mmap.as_ptr().add(64) as *const ClusterHeader;
+        CLUSTERS = Some(slice::from_raw_parts(clusters_ptr, k));
         
-        let num_clusters = u32::from_le_bytes(mmap_ptr.add(0).cast::<[u8; 4]>().read());
-        NUM_CLUSTERS = num_clusters;
-        
-        let centroids_size = (num_clusters as usize) * 14;
-        let centroids_ptr = mmap_ptr.add(8).cast::<i16>();
-        CENTROIDS = Some(slice::from_raw_parts(centroids_ptr, centroids_size));
-        
-        let offsets_offset = 8 + centroids_size * 2;
-        let offsets_ptr = mmap_ptr.add(offsets_offset).cast::<(u32, u32)>();
-        OFFSETS = Some(slice::from_raw_parts(offsets_ptr, num_clusters as usize));
+        let points_ptr = mmap.as_ptr().add(64 + k * 80) as *const Point;
+        let num_points = (mmap.len() - (64 + k * 80)) / 64;
+        POINTS = Some(slice::from_raw_parts(points_ptr, num_points));
 
         DATASET_MMAP = Some(mmap);
         0
@@ -49,51 +59,67 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn search(query_ptr: *const i16) -> i32 {
-    let query: &[i16] = unsafe { slice::from_raw_parts(query_ptr, 14) };
-    let mmap = unsafe { DATASET_MMAP.as_ref().unwrap() };
-    let num_clusters = unsafe { NUM_CLUSTERS };
-    let centroids = unsafe { CENTROIDS.unwrap() };
-    let offsets = unsafe { OFFSETS.unwrap() };
+pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
+    let q_f32 = slice::from_raw_parts(query_ptr, 14);
+    let mut q_vec = [0.0f32; 16];
+    q_vec[..14].copy_from_slice(q_f32);
+    
+    let clusters = CLUSTERS.as_ref().unwrap();
+    let points = POINTS.as_ref().unwrap();
 
-    let mut top_clusters = [(i32::MAX, 0usize); 8]; 
-
-    for i in 0..num_clusters as usize {
-        let mut dist_sq = 0i32;
-        let c_base = i * 14;
-        for j in 0..14 {
-            let diff = (query[j] as i32) - (centroids[c_base + j] as i32);
-            dist_sq += diff * diff;
-        }
-
-        if dist_sq < top_clusters[7].0 {
-            insert_top_clusters(dist_sq, i, &mut top_clusters);
-        }
-    }
-
-    let mut top_distances = [i32::MAX; 5];
+    let mut top_dists_sq = [f64::MAX; 5];
     let mut top_labels = [0u8; 5];
+    let mut tau_sq = f64::MAX;
 
-    let data_start_offset = 8 + (num_clusters as usize) * 28 + (num_clusters as usize) * 8;
+    let q0 = _mm256_loadu_ps(q_vec.as_ptr());
+    let q1 = _mm256_loadu_ps(q_vec.as_ptr().add(8));
+    let mask1 = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
 
-    for &(_, cluster_id) in top_clusters.iter() {
-        let (rec_offset, rec_count) = offsets[cluster_id];
-        if rec_count == 0 { continue; }
+    let mut cluster_dists_sq = Vec::with_capacity(clusters.len());
+    for (i, c) in clusters.iter().enumerate() {
+        let mut c_vec = [0.0f32; 16];
+        c_vec[..14].copy_from_slice(&c.centroid);
         
-        let byte_offset = data_start_offset + (rec_offset as usize) * RECORD_SIZE;
-        let chunk_data = &mmap[byte_offset .. byte_offset + (rec_count as usize) * RECORD_SIZE];
+        let n0 = _mm256_loadu_ps(c_vec.as_ptr());
+        let n1 = _mm256_loadu_ps(c_vec.as_ptr().add(8));
+        let d0 = _mm256_sub_ps(q0, n0);
+        let d1 = _mm256_sub_ps(q1, n1);
+        let d1m = _mm256_mul_ps(d1, mask1);
+        let s0 = _mm256_mul_ps(d0, d0);
+        let s1 = _mm256_fmadd_ps(d1m, d1m, s0);
+        let d2 = hsum_ps_avx(s1) as f64;
         
-        for chunk in chunk_data.chunks_exact(32) {
-            let mut dist_sq = 0i32;
-            for j in 0..14 {
-                let ref_val = i16::from_le_bytes([chunk[j * 2], chunk[j * 2 + 1]]) as i32;
-                let diff = (query[j] as i32) - ref_val;
-                dist_sq += diff * diff;
-            }
+        cluster_dists_sq.push((d2, i));
+    }
+    cluster_dists_sq.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-            if dist_sq < top_distances[4] {
-                let label = chunk[28];
-                insert_top5(dist_sq, label, &mut top_distances, &mut top_labels);
+    for (dist_to_centroid_sq, idx) in cluster_dists_sq {
+        let c = &clusters[idx];
+        
+        let dist_to_centroid = dist_to_centroid_sq.sqrt();
+        let radius = (c.radius_sq as f64).sqrt();
+        let tau = tau_sq.sqrt();
+        
+        if dist_to_centroid - radius >= tau {
+            continue;
+        }
+
+        let start = c.offset as usize;
+        let count = c.count as usize;
+        for i in 0..count {
+            let p = points.get_unchecked(start + i);
+            let n0 = _mm256_loadu_ps(p.vector.as_ptr());
+            let n1 = _mm256_loadu_ps(p.vector.as_ptr().add(8));
+            let d0 = _mm256_sub_ps(q0, n0);
+            let d1 = _mm256_sub_ps(q1, n1);
+            let d1m = _mm256_mul_ps(d1, mask1);
+            let s0 = _mm256_mul_ps(d0, d0);
+            let s1 = _mm256_fmadd_ps(d1m, d1m, s0);
+            let d2 = hsum_ps_avx(s1) as f64;
+
+            if d2 < tau_sq {
+                insert_top5(d2, p.label, &mut top_dists_sq, &mut top_labels);
+                tau_sq = top_dists_sq[4];
             }
         }
     }
@@ -102,39 +128,34 @@ pub extern "C" fn search(query_ptr: *const i16) -> i32 {
 }
 
 #[inline(always)]
-fn insert_top_clusters(dist: i32, id: usize, arr: &mut [(i32, usize); 8]) {
-    for i in 0..8 {
-        if dist < arr[i].0 {
-            for j in (i+1..8).rev() {
-                arr[j] = arr[j-1];
-            }
-            arr[i] = (dist, id);
-            break;
-        }
-    }
+unsafe fn hsum_ps_avx(v: __m256) -> f32 {
+    let x128 = _mm_add_ps(_mm256_extractf128_ps(v, 1), _mm256_castps256_ps128(v));
+    let x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
+    let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
+    _mm_cvtss_f32(x32)
 }
 
 #[inline(always)]
-fn insert_top5(dist: i32, label: u8, dists: &mut [i32; 5], labels: &mut [u8; 5]) {
-    if dist < dists[0] {
-        dists[4] = dists[3]; labels[4] = labels[3];
-        dists[3] = dists[2]; labels[3] = labels[2];
-        dists[2] = dists[1]; labels[2] = labels[1];
-        dists[1] = dists[0]; labels[1] = labels[0];
-        dists[0] = dist; labels[0] = label;
-    } else if dist < dists[1] {
-        dists[4] = dists[3]; labels[4] = labels[3];
-        dists[3] = dists[2]; labels[3] = labels[2];
-        dists[2] = dists[1]; labels[2] = labels[1];
-        dists[1] = dist; labels[1] = label;
-    } else if dist < dists[2] {
-        dists[4] = dists[3]; labels[4] = labels[3];
-        dists[3] = dists[2]; labels[3] = labels[2];
-        dists[2] = dist; labels[2] = label;
-    } else if dist < dists[3] {
-        dists[4] = dists[3]; labels[4] = labels[3];
-        dists[3] = dist; labels[3] = label;
-    } else {
-        dists[4] = dist; labels[4] = label;
+fn insert_top5(dist_sq: f64, label: u8, dists_sq: &mut [f64; 5], labels: &mut [u8; 5]) {
+    if dist_sq < dists_sq[0] {
+        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
+        dists_sq[3] = dists_sq[2]; labels[3] = labels[2];
+        dists_sq[2] = dists_sq[1]; labels[2] = labels[1];
+        dists_sq[1] = dists_sq[0]; labels[1] = labels[0];
+        dists_sq[0] = dist_sq; labels[0] = label;
+    } else if dist_sq < dists_sq[1] {
+        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
+        dists_sq[3] = dists_sq[2]; labels[3] = labels[2];
+        dists_sq[2] = dists_sq[1]; labels[2] = labels[1];
+        dists_sq[1] = dist_sq; labels[1] = label;
+    } else if dist_sq < dists_sq[2] {
+        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
+        dists_sq[3] = dists_sq[2]; labels[3] = labels[2];
+        dists_sq[2] = dist_sq; labels[2] = label;
+    } else if dist_sq < dists_sq[3] {
+        dists_sq[4] = dists_sq[3]; labels[4] = labels[3];
+        dists_sq[3] = dist_sq; labels[3] = label;
+    } else if dist_sq < dists_sq[4] {
+        dists_sq[4] = dist_sq; labels[4] = label;
     }
 }

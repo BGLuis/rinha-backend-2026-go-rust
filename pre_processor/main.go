@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"os"
@@ -16,12 +15,36 @@ type Record struct {
 	Label  string    `json:"label"`
 }
 
+type Point struct {
+	Vector [14]float32
+	Label  uint8
+	_pad   [7]byte
+}
+
+type ClusterHeader struct {
+	Centroid [14]float32
+	RadiusSq float32
+	Offset   uint32
+	Count    uint32
+	_pad     [12]byte
+}
+
+const K = 2048
+
+func calcDistSq(a, b *[14]float32) float32 {
+	var sum float32
+	for i := 0; i < 14; i++ {
+		diff := a[i] - b[i]
+		sum += diff * diff
+	}
+	return sum
+}
+
+func round4(v float64) float32 {
+	return float32(math.Round(v*10000) / 10000)
+}
+
 func main() {
-	numClusters := 1024
-	numCentroidSamples := 1024
-	
-	centroids := make([][14]int16, numClusters)
-	
 	file, err := os.Open("resources/references.json.gz")
 	if err != nil {
 		log.Fatal(err)
@@ -29,100 +52,103 @@ func main() {
 	gz, _ := gzip.NewReader(file)
 	decoder := json.NewDecoder(gz)
 	decoder.Token()
-	
-	count := 0
-	for decoder.More() && count < numCentroidSamples {
-		var r Record
-		decoder.Decode(&r)
-		for i := 0; i < 14; i++ {
-			centroids[count][i] = int16(math.Round(r.Vector[i] * 8192.0))
-		}
-		count++
-	}
-	gz.Close()
-	file.Close()
 
-	clusterFiles := make([]*os.File, numClusters)
-	clusterCounts := make([]uint32, numClusters)
-	for i := 0; i < numClusters; i++ {
-		f, _ := os.Create(fmt.Sprintf("cluster_%d.bin", i))
-		clusterFiles[i] = f
-	}
+	const N = 3000000
+	points := make([]Point, 0, N)
 
-	file, _ = os.Open("resources/references.json.gz")
-	gz, _ = gzip.NewReader(file)
-	decoder = json.NewDecoder(gz)
-	decoder.Token()
-
-	totalCount := 0
-	recordBuf := make([]byte, 32)
+	fmt.Println("Carregando vetores...")
 	for decoder.More() {
 		var r Record
 		decoder.Decode(&r)
-		
-		var v [14]int16
+		var p Point
 		for i := 0; i < 14; i++ {
-			v[i] = int16(math.Round(r.Vector[i] * 8192.0))
-		}
-
-		bestCluster := 0
-		minDist := int32(math.MaxInt32)
-		for c := 0; c < numClusters; c++ {
-			var dist int32 = 0
-			for i := 0; i < 14; i++ {
-				diff := int32(v[i]) - int32(centroids[c][i])
-				dist += diff * diff
-			}
-			if dist < minDist {
-				minDist = dist
-				bestCluster = c
-			}
-		}
-
-		for i := 0; i < 14; i++ {
-			binary.LittleEndian.PutUint16(recordBuf[i*2:i*2+2], uint16(v[i]))
+			p.Vector[i] = float32(r.Vector[i])
 		}
 		if r.Label == "fraud" {
-			recordBuf[28] = 1
-		} else {
-			recordBuf[28] = 0
+			p.Label = 1
 		}
-		recordBuf[29], recordBuf[30], recordBuf[31] = 0, 0, 0
-		
-		clusterFiles[bestCluster].Write(recordBuf)
-		clusterCounts[bestCluster]++
-
-		totalCount++
-	}
-	
-	for _, f := range clusterFiles {
-		f.Close()
+		points = append(points, p)
 	}
 	gz.Close()
 	file.Close()
 
+	n := len(points)
+	centroids := make([][14]float32, K)
+	for i := 0; i < K; i++ {
+		centroids[i] = points[(i*2931)%n].Vector
+	}
+
+	assignments := make([]int, n)
+	for iter := 0; iter < 10; iter++ {
+		fmt.Printf("K-Means iter %d...\n", iter+1)
+		for i := 0; i < n; i++ {
+			bestD2 := float32(1e30)
+			bestC := 0
+			for c := 0; c < K; c++ {
+				d2 := calcDistSq(&points[i].Vector, &centroids[c])
+				if d2 < bestD2 {
+					bestD2 = d2
+					bestC = c
+				}
+			}
+			assignments[i] = bestC
+		}
+		newCentroids := make([][14]float32, K)
+		counts := make([]int, K)
+		for i := 0; i < n; i++ {
+			c := assignments[i]
+			for d := 0; d < 14; d++ {
+				newCentroids[c][d] += points[i].Vector[d]
+			}
+			counts[c]++
+		}
+		for c := 0; c < K; c++ {
+			if counts[c] > 0 {
+				for d := 0; d < 14; d++ {
+					centroids[c][d] = newCentroids[c][d] / float32(counts[c])
+				}
+			}
+		}
+	}
+
+	headers := make([]ClusterHeader, K)
+	for c := 0; c < K; c++ {
+		headers[c].Centroid = centroids[c]
+	}
+
+	for i := 0; i < n; i++ {
+		c := assignments[i]
+		headers[c].Count++
+		d2 := calcDistSq(&points[i].Vector, &centroids[c])
+		if d2 > headers[c].RadiusSq {
+			headers[c].RadiusSq = d2
+		}
+	}
+
+	var offset uint32 = 0
+	for c := 0; c < K; c++ {
+		headers[c].Offset = offset
+		offset += headers[c].Count
+	}
+
+	reordered := make([]Point, n)
+	insertPos := make([]uint32, K)
+	for c := 0; c < K; c++ {
+		insertPos[c] = headers[c].Offset
+	}
+	for i := 0; i < n; i++ {
+		c := assignments[i]
+		reordered[insertPos[c]] = points[i]
+		insertPos[c]++
+	}
+
+	fmt.Println("Gravando dataset.bin...")
 	out, _ := os.Create("dataset.bin")
-	
-	binary.Write(out, binary.LittleEndian, uint32(numClusters))
-	binary.Write(out, binary.LittleEndian, uint32(14))
-
-	for i := 0; i < numClusters; i++ {
-		binary.Write(out, binary.LittleEndian, centroids[i])
-	}
-
-	currentOffset := uint32(0)
-	for i := 0; i < numClusters; i++ {
-		binary.Write(out, binary.LittleEndian, currentOffset)
-		binary.Write(out, binary.LittleEndian, clusterCounts[i])
-		currentOffset += clusterCounts[i]
-	}
-
-	for i := 0; i < numClusters; i++ {
-		name := fmt.Sprintf("cluster_%d.bin", i)
-		f, _ := os.Open(name)
-		io.Copy(out, f)
-		f.Close()
-		os.Remove(name)
-	}
+	binary.Write(out, binary.LittleEndian, uint32(K))
+	padding := make([]byte, 60) // Align to 64
+	out.Write(padding)
+	binary.Write(out, binary.LittleEndian, headers)
+	binary.Write(out, binary.LittleEndian, reordered)
 	out.Close()
+	fmt.Println("Concluído!")
 }

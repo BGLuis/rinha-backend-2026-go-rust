@@ -6,7 +6,7 @@ package main
 #include <stdlib.h>
 
 int32_t init_engine(const char* path);
-int32_t search(const int16_t* query);
+int32_t search(const float* query);
 */
 import "C"
 
@@ -117,6 +117,10 @@ func clamp(v float64) float64 {
 	return v
 }
 
+func round4(v float64) float32 {
+	return float32(math.Round(v*10000) / 10000)
+}
+
 func fastHandler(ctx *fasthttp.RequestCtx) {
 	start := time.Now()
 	path := ctx.Path()
@@ -128,70 +132,93 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 	if string(path) == "/fraud-score" && ctx.IsPost() {
 		body := ctx.PostBody()
 
-		var vector [14]int16
+		var vector [14]float32
 
 		amt, _ := jsonparser.GetFloat(body, "transaction", "amount")
-		vector[0] = int16(math.Round(clamp(amt/MaxAmount) * 8192))
+		vector[0] = round4(clamp(amt / MaxAmount))
 
 		inst, _ := jsonparser.GetInt(body, "transaction", "installments")
-		vector[1] = int16(math.Round(clamp(float64(inst)/MaxInstallments) * 8192))
+		vector[1] = round4(clamp(float64(inst) / MaxInstallments))
 
 		cAvgAmt, _ := jsonparser.GetFloat(body, "customer", "avg_amount")
-		vector[2] = int16(math.Round(clamp((amt/cAvgAmt)/AmountVsAvgRatio) * 8192))
+		vector[2] = round4(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
 
 		reqAtStr, _ := jsonparser.GetString(body, "transaction", "requested_at")
 		reqAt, _ := time.Parse(time.RFC3339, reqAtStr)
-		vector[3] = int16(math.Round((float64(reqAt.Hour()) / 23.0) * 8192))
-		vector[4] = int16(math.Round((float64((int(reqAt.Weekday())+6)%7) / 6.0) * 8192))
+		reqAt = reqAt.UTC()
+		vector[3] = round4(float64(reqAt.Hour()) / 23.0)
+		vector[4] = round4(float64((int(reqAt.Weekday())+6)%7) / 6.0)
 
 		lastTx, _, _, _ := jsonparser.Get(body, "last_transaction")
 		if lastTx == nil {
-			vector[5] = -8192
-			vector[6] = -8192
+			vector[5] = -1.0
+			vector[6] = -1.0
 		} else {
 			lastTsStr, _ := jsonparser.GetString(lastTx, "timestamp")
 			lastTs, _ := time.Parse(time.RFC3339, lastTsStr)
-			minutes := reqAt.Sub(lastTs).Minutes()
-			vector[5] = int16(math.Round(clamp(minutes/MaxMinutes) * 8192))
-
+			lastTs = lastTs.UTC()
+			// Usar diferença inteira de segundos para minutos (floor)
+			diffSeconds := reqAt.Unix() - lastTs.Unix()
+			minutes := float64(diffSeconds / 60)
+			vector[5] = round4(clamp(minutes / MaxMinutes))
+		...
 			kmLast, _ := jsonparser.GetFloat(lastTx, "km_from_current")
-			vector[6] = int16(math.Round(clamp(kmLast/MaxKm) * 8192))
+			vector[6] = round4(clamp(kmLast / MaxKm))
 		}
 
 		kmHome, _ := jsonparser.GetFloat(body, "terminal", "km_from_home")
-		vector[7] = int16(math.Round(clamp(kmHome/MaxKm) * 8192))
+		vector[7] = round4(clamp(kmHome / MaxKm))
 
 		txCount, _ := jsonparser.GetInt(body, "customer", "tx_count_24h")
-		vector[8] = int16(math.Round(clamp(float64(txCount)/MaxTxCount24h) * 8192))
+		vector[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
 
 		isOnline, _ := jsonparser.GetBoolean(body, "terminal", "is_online")
-		if isOnline { vector[9] = 8192 } else { vector[9] = 0 }
+		if isOnline {
+			vector[9] = 1.0
+		} else {
+			vector[9] = 0.0
+		}
 
 		cardPresent, _ := jsonparser.GetBoolean(body, "terminal", "card_present")
-		if cardPresent { vector[10] = 8192 } else { vector[10] = 0 }
+		if cardPresent {
+			vector[10] = 1.0
+		} else {
+			vector[10] = 0.0
+		}
 
 		merchantId, _ := jsonparser.GetString(body, "merchant", "id")
 		known := false
 		jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-			if string(value) == merchantId { known = true }
+			if dataType == jsonparser.String {
+				val, _ := jsonparser.ParseString(value)
+				if val == merchantId {
+					known = true
+				}
+			}
 		}, "customer", "known_merchants")
-		if !known { vector[11] = 8192 } else { vector[11] = 0 }
+		if !known {
+			vector[11] = 1.0
+		} else {
+			vector[11] = 0.0
+		}
 
 		mcc, _ := jsonparser.GetString(body, "merchant", "mcc")
 		risk, ok := MccRisk[mcc]
-		if !ok { risk = 0.5 }
-		vector[12] = int16(math.Round(risk * 8192))
+		if !ok {
+			risk = 0.5
+		}
+		vector[12] = round4(risk)
 
 		mAvgAmt, _ := jsonparser.GetFloat(body, "merchant", "avg_amount")
-		vector[13] = int16(math.Round(clamp(mAvgAmt/MaxMerchantAvgAmount) * 8192))
+		vector[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
 
-		if time.Since(start) > 1200*time.Millisecond {
+		if time.Since(start) > 1800*time.Millisecond {
 			ctx.SetContentType("application/json")
 			ctx.Write(resp0)
 			return
 		}
 
-		frauds := C.search((*C.int16_t)(unsafe.Pointer(&vector[0])))
+		frauds := C.search((*C.float)(unsafe.Pointer(&vector[0])))
 
 		ctx.SetContentType("application/json")
 		switch frauds {
