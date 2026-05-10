@@ -13,7 +13,6 @@ import "C"
 import (
 	"encoding/json"
 	"log"
-	"math"
 	"net"
 	"os"
 	"time"
