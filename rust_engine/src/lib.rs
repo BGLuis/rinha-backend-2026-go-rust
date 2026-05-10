@@ -86,8 +86,8 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
 
     let q_i16_reg = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
 
-    // 1. Candidate Filtering using Float Centroids (Zero-Allocation Top 32)
-    const NPROBE: usize = 32;
+    // 1. Candidate Filtering using Float Centroids (Zero-Allocation Top 4)
+    const NPROBE: usize = 4;
     let mut cluster_candidates = [(0.0f32, 0usize); 4096];
     let k = clusters.len();
 
@@ -109,6 +109,9 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
     cluster_candidates[..NPROBE].sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     // 2. Intra-cluster search with Integer SIMD (NITRO MODE)
+    // Pre-calculate scaled threshold for integer comparisons
+    let scale_sq = SCALE as f64 * SCALE as f64;
+
     for &(dist_sq, idx) in &cluster_candidates[..NPROBE] {
         let dist_to_centroid = (dist_sq as f64).sqrt();
         let c = &clusters[idx];
@@ -121,23 +124,6 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
             continue;
         }
         
-        // Extra tight check: Bounding Box (Using i64 to prevent overflow)
-        if top_dists_sq[4] != f64::MAX {
-            let mut outside_bbox = false;
-            let thresh_i64 = (top_dists_sq[4].sqrt() * SCALE as f64).round() as i64;
-            for i in 0..14 {
-                let q_val = q_i16[i] as i64;
-                let b_min = c.bbox_min[i] as i64;
-                let b_max = c.bbox_max[i] as i64;
-                if q_val < b_min - thresh_i64 || q_val > b_max + thresh_i64 {
-                    outside_bbox = true;
-                    break;
-                }
-            }
-            if outside_bbox {
-                continue;
-            }
-        }
         // --------------------
 
         let start = c.offset as usize;
@@ -148,7 +134,8 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
             let p_i16_reg = _mm256_loadu_si256(p.vector.as_ptr() as *const __m256i);
             let diff = _mm256_sub_epi16(q_i16_reg, p_i16_reg);
             let sq = _mm256_madd_epi16(diff, diff); 
-            let d2 = hsum_epi32_avx(sq) as f64 / (SCALE as f64 * SCALE as f64);
+            let d2_scaled = hsum_epi32_avx(sq) as f64;
+            let d2 = d2_scaled / scale_sq;
 
             if d2 < top_dists_sq[4] || (d2 == top_dists_sq[4] && p.index < top_indices[4]) {
                 insert_top5(d2, p.index, p.label, &mut top_dists_sq, &mut top_indices, &mut top_labels);

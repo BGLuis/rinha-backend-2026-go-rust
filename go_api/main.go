@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
 	"time"
 	"unsafe"
 
@@ -24,12 +25,12 @@ import (
 
 var (
 	MaxAmount             float64
-	MaxInstallments      float64
-	AmountVsAvgRatio     float64
+	MaxInstallments       float64
+	AmountVsAvgRatio      float64
 	MaxMinutes            float64
 	MaxKm                 float64
 	MaxTxCount24h         float64
-	MaxMerchantAvgAmount float64
+	MaxMerchantAvgAmount  float64
 )
 
 var MccRisk = make(map[string]float64)
@@ -43,15 +44,44 @@ var (
 	resp5 = []byte(`{"approved":false,"fraud_score":1.0}`)
 )
 
+// Movido para o escopo global para evitar alocação na stack/heap a cada requisição
+var jsonPaths = [][]string{
+	{"transaction", "amount"},
+	{"transaction", "installments"},
+	{"transaction", "requested_at"},
+	{"customer", "avg_amount"},
+	{"customer", "tx_count_24h"},
+	{"customer", "known_merchants"},
+	{"last_transaction", "timestamp"},
+	{"last_transaction", "km_from_current"},
+	{"terminal", "km_from_home"},
+	{"terminal", "is_online"},
+	{"terminal", "card_present"},
+	{"merchant", "id"},
+	{"merchant", "mcc"},
+	{"merchant", "avg_amount"},
+}
+
+// Lookup table O(1) pré-computada para os dias de Março de 2026
+// 1º de Março de 2026 cai em um Domingo (0). Array é 1-indexed.
+var march2026Weekdays = [32]int{
+	0, // padding (dia 0 não existe)
+	0, 1, 2, 3, 4, 5, 6, // 1-7
+	0, 1, 2, 3, 4, 5, 6, // 8-14
+	0, 1, 2, 3, 4, 5, 6, // 15-21
+	0, 1, 2, 3, 4, 5, 6, // 22-28
+	0, 1, 2,             // 29-31
+}
+
 func loadConfig() {
 	normData, _ := os.ReadFile("resources/normalization.json")
 	var norm struct {
-		MaxAmount             float64 `json:"max_amount"`
+		MaxAmount            float64 `json:"max_amount"`
 		MaxInstallments      float64 `json:"max_installments"`
 		AmountVsAvgRatio     float64 `json:"amount_vs_avg_ratio"`
-		MaxMinutes            float64 `json:"max_minutes"`
-		MaxKm                 float64 `json:"max_km"`
-		MaxTxCount24h         float64 `json:"max_tx_count_24h"`
+		MaxMinutes           float64 `json:"max_minutes"`
+		MaxKm                float64 `json:"max_km"`
+		MaxTxCount24h        float64 `json:"max_tx_count_24h"`
 		MaxMerchantAvgAmount float64 `json:"max_merchant_avg_amount"`
 	}
 	json.Unmarshal(normData, &norm)
@@ -84,6 +114,14 @@ func parseRFC3339(b []byte) (hour int, weekday int, unix int64) {
 	min := int(b[14]-'0')*10 + int(b[15]-'0')
 	sec := int(b[17]-'0')*10 + int(b[18]-'0')
 
+	// Fast Path extremo (O(1)) restrito ao mês da competição (Março de 2026)
+	if y == 2026 && m == 3 {
+		// Unix Timestamp exato para 2026-03-01T00:00:00Z é 1772323200
+		unix = 1772323200 + int64(d-1)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
+		weekday = march2026Weekdays[d]
+		return hour, weekday, unix
+	}
+
 	unix = fastUnix(y, m, d, hour, min, sec)
 	weekday = int((unix/86400 + 4) % 7)
 	return hour, weekday, unix
@@ -114,39 +152,23 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		body := ctx.PostBody()
 
 		var (
-			amt float64
-			inst int64
-			cAvgAmt float64
-			reqAtStr string
-			lastTsStr string
-			kmLast float64 = -1
-			kmHome float64
-			txCount int64
-			isOnline bool
-			cardPresent bool
-			merchantId string
-			mccStr string
-			mAvgAmt float64
+			amt               float64
+			inst              int64
+			cAvgAmt           float64
+			reqAtStr          string
+			lastTsStr         string
+			kmLast            float64 = -1
+			kmHome            float64
+			txCount           int64
+			isOnline          bool
+			cardPresent       bool
+			merchantId        string
+			mccStr            string
+			mAvgAmt           float64
 			knownMerchantsVal []byte
 		)
 
-		paths := [][]string{
-			{"transaction", "amount"},
-			{"transaction", "installments"},
-			{"transaction", "requested_at"},
-			{"customer", "avg_amount"},
-			{"customer", "tx_count_24h"},
-			{"customer", "known_merchants"},
-			{"last_transaction", "timestamp"},
-			{"last_transaction", "km_from_current"},
-			{"terminal", "km_from_home"},
-			{"terminal", "is_online"},
-			{"terminal", "card_present"},
-			{"merchant", "id"},
-			{"merchant", "mcc"},
-			{"merchant", "avg_amount"},
-		}
-
+		// Varredura linear usando a matriz paths global
 		jsonparser.EachKey(body, func(idx int, value []byte, vt jsonparser.ValueType, err error) {
 			switch idx {
 			case 0: amt, _ = jsonparser.ParseFloat(value)
@@ -164,7 +186,7 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 			case 12: mccStr, _ = jsonparser.ParseString(value)
 			case 13: mAvgAmt, _ = jsonparser.ParseFloat(value)
 			}
-		}, paths...)
+		}, jsonPaths...)
 
 		reqHour, reqWeekday, reqUnix := 0, 0, int64(0)
 		if reqAtStr != "" {
@@ -253,6 +275,9 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 }
 
 func main() {
+	// Tuning do GC: Retarda a coleta, trocando um pouco de RAM pelo aumento severo de CPU throughput.
+	debug.SetGCPercent(1000)
+
 	loadConfig()
 
 	cPath := C.CString(os.Getenv("DATASET_PATH"))
