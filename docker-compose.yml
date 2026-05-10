@@ -1,5 +1,23 @@
 version: '3.8'
 
+x-api-common: &api-common
+  build: .
+  volumes:
+    - shared_sockets:/tmp/sockets
+  networks:
+    - rinha-net
+  security_opt:
+    - seccomp:unconfined
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  deploy:
+    resources:
+      limits:
+        cpus: '0.42'
+        memory: '160M'
+
 services:
   nginx:
     image: nginx:alpine
@@ -11,6 +29,14 @@ services:
     depends_on:
       - api1
       - api2
+    networks:
+      - rinha-net
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
@@ -18,34 +44,20 @@ services:
           memory: '30M'
 
   api1:
-    build: .
-    volumes:
-      - shared_sockets:/tmp/sockets
+    <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOGC=1000
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
-    deploy:
-      resources:
-        limits:
-          cpus: '0.42'
-          memory: '160M'
 
   api2:
-    build: .
-    volumes:
-      - shared_sockets:/tmp/sockets
+    <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOGC=1000
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
-    deploy:
-      resources:
-        limits:
-          cpus: '0.42'
-          memory: '160M'
 
 volumes:
   shared_sockets:
@@ -53,3 +65,7 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
+
+networks:
+  rinha-net:
+    driver: bridge

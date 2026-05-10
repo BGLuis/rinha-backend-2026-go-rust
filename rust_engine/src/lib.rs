@@ -86,9 +86,13 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
 
     let q_i16_reg = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
 
-    // 1. Candidate Filtering using Float Centroids
-    let mut cluster_candidates = Vec::with_capacity(clusters.len());
-    for (i, c) in clusters.iter().enumerate() {
+    // 1. Candidate Filtering using Float Centroids (Zero-Allocation Top 32)
+    const NPROBE: usize = 32;
+    let mut cluster_candidates = [(0.0f32, 0usize); 4096];
+    let k = clusters.len();
+
+    for i in 0..k {
+        let c = &clusters[i];
         let mut c_vec = [0.0f32; 16];
         c_vec[..14].copy_from_slice(&c.centroid);
         let n0 = _mm256_loadu_ps(c_vec.as_ptr());
@@ -98,12 +102,15 @@ pub unsafe extern "C" fn search(query_ptr: *const f32) -> i32 {
         let d1m = _mm256_mul_ps(d1, mask1_f32);
         let s0 = _mm256_mul_ps(d0, d0);
         let s1 = _mm256_fmadd_ps(d1m, d1m, s0);
-        cluster_candidates.push((hsum_ps_avx(s1).sqrt() as f64, i));
+        cluster_candidates[i] = (hsum_ps_avx(s1), i);
     }
-    cluster_candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    cluster_candidates[..k].select_nth_unstable_by(NPROBE, |a, b| a.0.partial_cmp(&b.0).unwrap());
+    cluster_candidates[..NPROBE].sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     // 2. Intra-cluster search with Integer SIMD (NITRO MODE)
-    for (dist_to_centroid, idx) in cluster_candidates {
+    for &(dist_sq, idx) in &cluster_candidates[..NPROBE] {
+        let dist_to_centroid = (dist_sq as f64).sqrt();
         let c = &clusters[idx];
         
         // --- Pruning Step ---
