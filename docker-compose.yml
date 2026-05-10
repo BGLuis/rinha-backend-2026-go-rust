@@ -15,7 +15,7 @@ services:
           memory: '30M'
 
   api1:
-    image: bgluis/rinha-api-2026:latest
+    image: luiis001/rinha-api-2026:latest
     volumes:
       - shared_sockets:/tmp/sockets
     environment:
@@ -27,7 +27,7 @@ services:
           memory: '160M'
 
   api2:
-    image: bgluis/rinha-api-2026:latest
+    image: luiis001/rinha-api-2026:latest
     volumes:
       - shared_sockets:/tmp/sockets
     environment:
