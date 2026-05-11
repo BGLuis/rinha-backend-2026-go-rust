@@ -148,16 +148,10 @@ unsafe fn dist_sq_i16_avx(q: __m256i, p: __m256i) -> u64 {
     let diff = _mm256_sub_epi16(q, p);
     let sq_i32 = _mm256_madd_epi16(diff, diff);
     
-    let low_32 = _mm256_castsi256_si128(sq_i32);
-    let high_32 = _mm256_extracti128_si256(sq_i32, 1);
-    
-    let low_64 = _mm256_cvtepu32_epi64(low_32);
-    let high_64 = _mm256_cvtepu32_epi64(high_32);
-    let sum_64 = _mm256_add_epi64(low_64, high_64);
-    
-    let x128 = _mm_add_epi64(_mm256_extracti128_si256(sum_64, 1), _mm256_castsi256_si128(sum_64));
-    let x64 = _mm_add_epi64(x128, _mm_srli_si128(x128, 8));
-    _mm_extract_epi64(x64, 0) as u64
+    let x128 = _mm_add_epi32(_mm256_extracti128_si256(sq_i32, 1), _mm256_castsi256_si128(sq_i32));
+    let x64 = _mm_add_epi32(x128, _mm_srli_si128(x128, 8));
+    let x32 = _mm_add_epi32(x64, _mm_srli_si128(x64, 4));
+    _mm_cvtsi128_si32(x32) as u64
 }
 
 #[inline(always)]

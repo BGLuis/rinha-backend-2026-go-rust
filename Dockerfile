@@ -25,7 +25,7 @@ FROM rust-env AS dataset-builder
 COPY resources/ ./resources/
 COPY rust_engine/src ./src
 # Gera o dataset.bin.
-RUN cargo run --release --bin build_index && ls -lh dataset.bin
+RUN touch src/bin/build_index.rs && cargo run --release --bin build_index && ls -lh dataset.bin
 
 # --- Estágio Builder Go: API com CGO ---
 FROM golang:1.22-bookworm AS go-builder

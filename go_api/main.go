@@ -11,6 +11,7 @@ int32_t search_vector(const float* query);
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"math"
@@ -110,30 +111,61 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 	if len(path) == 12 && path[1] == 'f' && ctx.IsPost() { // /fraud-score
 		body := ctx.PostBody()
 
-		amt, _ := jsonparser.GetFloat(body, "transaction", "amount")
-		inst, _ := jsonparser.GetInt(body, "transaction", "installments")
-		reqAtStr, _ := jsonparser.GetString(body, "transaction", "requested_at")
+		var (
+			amt         float64
+			inst        int64
+			reqAtStr    string
+			cAvgAmt     float64
+			txCount     int64
+			merchantId  []byte
+			mccStr      string
+			mAvgAmt     float64
+			isOnline    bool
+			cardPresent bool
+			kmHome      float64
+		)
 
-		cAvgAmt, _ := jsonparser.GetFloat(body, "customer", "avg_amount")
-		txCount, _ := jsonparser.GetInt(body, "customer", "tx_count_24h")
+		paths := [][]string{
+			{"transaction", "amount"},
+			{"transaction", "installments"},
+			{"transaction", "requested_at"},
+			{"customer", "avg_amount"},
+			{"customer", "tx_count_24h"},
+			{"merchant", "id"},
+			{"merchant", "mcc"},
+			{"merchant", "avg_amount"},
+			{"terminal", "is_online"},
+			{"terminal", "card_present"},
+			{"terminal", "km_from_home"},
+		}
 
-		merchantId, _ := jsonparser.GetString(body, "merchant", "id")
-		mccStr, _ := jsonparser.GetString(body, "merchant", "mcc")
-		mAvgAmt, _ := jsonparser.GetFloat(body, "merchant", "avg_amount")
-
-		isOnline, _ := jsonparser.GetBoolean(body, "terminal", "is_online")
-		cardPresent, _ := jsonparser.GetBoolean(body, "terminal", "card_present")
-		kmHome, _ := jsonparser.GetFloat(body, "terminal", "km_from_home")
+		jsonparser.EachKey(body, func(idx int, value []byte, dataType jsonparser.ValueType, err error) {
+			switch idx {
+			case 0: amt, _ = jsonparser.ParseFloat(value)
+			case 1: inst, _ = jsonparser.ParseInt(value)
+			case 2: reqAtStr, _ = jsonparser.ParseString(value)
+			case 3: cAvgAmt, _ = jsonparser.ParseFloat(value)
+			case 4: txCount, _ = jsonparser.ParseInt(value)
+			case 5:
+				if len(value) >= 2 && value[0] == '"' {
+					merchantId = value[1 : len(value)-1]
+				} else {
+					merchantId = value
+				}
+			case 6: mccStr, _ = jsonparser.ParseString(value)
+			case 7: mAvgAmt, _ = jsonparser.ParseFloat(value)
+			case 8: isOnline, _ = jsonparser.ParseBoolean(value)
+			case 9: cardPresent, _ = jsonparser.ParseBoolean(value)
+			case 10: kmHome, _ = jsonparser.ParseFloat(value)
+			}
+		}, paths...)
 
 		lastTx, _, _, _ := jsonparser.Get(body, "last_transaction")
 
 		known := false
 		jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-			if !known {
-				val, _ := jsonparser.ParseString(value)
-				if val == merchantId {
-					known = true
-				}
+			if !known && bytes.Equal(value, merchantId) {
+				known = true
 			}
 		}, "customer", "known_merchants")
 
@@ -154,7 +186,7 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		q[3] = round4(float32(reqHour) / 23.0)
 		q[4] = round4(float32(reqWeekday) / 6.0)
 
-		if lastTx == nil || len(lastTx) == 0 || (len(lastTx) == 4 && string(lastTx) == "null") {
+		if lastTx == nil || len(lastTx) == 0 || bytes.Equal(lastTx, []byte("null")) {
 			q[5] = -1.0
 			q[6] = -1.0
 		} else {
