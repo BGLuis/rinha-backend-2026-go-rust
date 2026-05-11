@@ -47,6 +47,7 @@ services:
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOGC=off
+      - GC_MODE=off
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
@@ -55,6 +56,7 @@ services:
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOGC=off
+      - GC_MODE=off
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
