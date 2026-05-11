@@ -3,6 +3,8 @@ use std::fs::File;
 use std::os::raw::c_char;
 use std::slice;
 use memmap2::{Mmap, MmapOptions};
+
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 static mut DATASET_MMAP: Option<Mmap> = None;
@@ -51,10 +53,6 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
     // lossless i16 query
     let mut q_i16 = [0i16; 16];
     for d in 0..14 { q_i16[d] = (q[d] * 10000.0).round() as i16; }
-    let q_i16_simd = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
-
-    let q_low = _mm256_loadu_ps(q.as_ptr());
-    let q_high = _mm256_loadu_ps(q.as_ptr().add(8));
 
     let centroids = CENTROIDS.unwrap();
     let bboxes = BBOXES.unwrap();
@@ -71,13 +69,7 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
     let mut best_ki = 0;
     let mut best_kd2 = f32::MAX;
     for (ki, c) in centroids.iter().enumerate() {
-        let c_low = _mm256_loadu_ps(c.as_ptr());
-        let c_high = _mm256_loadu_ps(c.as_ptr().add(8));
-        let d_low = _mm256_sub_ps(q_low, c_low);
-        let d_high = _mm256_sub_ps(q_high, c_high);
-        let mut sq = _mm256_mul_ps(d_low, d_low);
-        sq = _mm256_fmadd_ps(d_high, d_high, sq);
-        let d2 = hsum_ps_avx(sq);
+        let d2 = dist_sq_f32_arch(q.as_ptr(), c.as_ptr());
         if d2 < best_kd2 {
             best_kd2 = d2;
             best_ki = ki;
@@ -85,17 +77,17 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
     }
 
     // 2. Scan best cluster
-    scan_cluster(best_ki, q_i16_simd, mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
+    scan_cluster(best_ki, q_i16.as_ptr(), mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
 
     // 3. Exhaustive search with BBox Pruning (Integer Exact)
     for ki in 0..num_k {
         if ki == best_ki { continue; }
         
         let bbox = &bboxes[ki];
-        let min_d2_u64 = dist_to_bbox_i16(q_i16_simd, bbox);
+        let min_d2_u64 = dist_to_bbox_i16_arch(q_i16.as_ptr(), bbox);
         
         if min_d2_u64 <= top_dists_u64[4] {
-            scan_cluster(ki, q_i16_simd, mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
+            scan_cluster(ki, q_i16.as_ptr(), mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
         }
     }
 
@@ -103,16 +95,17 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
 }
 
 #[inline(always)]
-unsafe fn scan_cluster(ki: usize, q_i16: __m256i, mmap_ptr: *const u8, offsets: &[u32], sizes: &[u32], top_dists_u64: &mut [u64; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
+unsafe fn scan_cluster(ki: usize, q_i16: *const i16, mmap_ptr: *const u8, offsets: &[u32], sizes: &[u32], top_dists_u64: &mut [u64; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
     let n = sizes[ki] as usize;
     let base_ptr = mmap_ptr.add(offsets[ki] as usize);
     
     for i in 0..n {
-        let p_ptr = base_ptr.add(i * 36) as *const __m256i;
+        let p_ptr = base_ptr.add(i * 36) as *const i16;
+        
+        #[cfg(target_arch = "x86_64")]
         _mm_prefetch(base_ptr.add((i + 8) * 36) as *const i8, _MM_HINT_T0);
 
-        let p_i16 = _mm256_loadu_si256(p_ptr);
-        let d2 = dist_sq_i16_avx(q_i16, p_i16);
+        let d2 = dist_sq_i16_arch(q_i16, p_ptr);
 
         if d2 <= top_dists_u64[4] {
             let meta_ptr = (p_ptr as *const u8).add(32) as *const u32;
@@ -128,21 +121,78 @@ unsafe fn scan_cluster(ki: usize, q_i16: __m256i, mmap_ptr: *const u8, offsets: 
 }
 
 #[inline(always)]
-unsafe fn dist_to_bbox_i16(q_i16: __m256i, bbox: &[i16; 32]) -> u64 {
-    let b_min = _mm256_loadu_si256(bbox.as_ptr() as *const __m256i);
-    let b_max = _mm256_loadu_si256(bbox.as_ptr().add(16) as *const __m256i);
-    let zero = _mm256_setzero_si256();
-
-    // d1 = min - q; d2 = q - max
-    let d1 = _mm256_sub_epi16(b_min, q_i16);
-    let d2 = _mm256_sub_epi16(q_i16, b_max);
-    
-    // diff = max(0, max(d1, d2))
-    let diff = _mm256_max_epi16(zero, _mm256_max_epi16(d1, d2));
-    
-    dist_sq_i16_avx(diff, zero) // Reuse sum-of-squares logic
+unsafe fn dist_sq_f32_arch(q: *const f32, p: *const f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let q_low = _mm256_loadu_ps(q);
+        let q_high = _mm256_loadu_ps(q.add(8));
+        let c_low = _mm256_loadu_ps(p);
+        let c_high = _mm256_loadu_ps(p.add(8));
+        let d_low = _mm256_sub_ps(q_low, c_low);
+        let d_high = _mm256_sub_ps(q_high, c_high);
+        let mut sq = _mm256_mul_ps(d_low, d_low);
+        sq = _mm256_fmadd_ps(d_high, d_high, sq);
+        hsum_ps_avx(sq)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut d2 = 0.0f32;
+        for d in 0..14 {
+            let diff = *q.add(d) - *p.add(d);
+            d2 += diff * diff;
+        }
+        d2
+    }
 }
 
+#[inline(always)]
+unsafe fn dist_to_bbox_i16_arch(q_i16: *const i16, bbox: &[i16; 32]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let q_simd = _mm256_loadu_si256(q_i16 as *const __m256i);
+        let b_min = _mm256_loadu_si256(bbox.as_ptr() as *const __m256i);
+        let b_max = _mm256_loadu_si256(bbox.as_ptr().add(16) as *const __m256i);
+        let zero = _mm256_setzero_si256();
+
+        let d1 = _mm256_sub_epi16(b_min, q_simd);
+        let d2 = _mm256_sub_epi16(q_simd, b_max);
+        let diff = _mm256_max_epi16(zero, _mm256_max_epi16(d1, d2));
+        dist_sq_i16_avx(diff, zero)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut d2 = 0u64;
+        for d in 0..14 {
+            let min = bbox[d];
+            let max = bbox[d + 16];
+            let q = *q_i16.add(d);
+            let diff = if q < min { (min - q) as i32 } else if q > max { (q - max) as i32 } else { 0 };
+            d2 += (diff * diff) as u64;
+        }
+        d2
+    }
+}
+
+#[inline(always)]
+unsafe fn dist_sq_i16_arch(q: *const i16, p: *const i16) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let q_simd = _mm256_loadu_si256(q as *const __m256i);
+        let p_simd = _mm256_loadu_si256(p as *const __m256i);
+        dist_sq_i16_avx(q_simd, p_simd)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let mut d2 = 0u64;
+        for d in 0..14 {
+            let diff = (*q.add(d) as i32) - (*p.add(d) as i32);
+            d2 += (diff * diff) as u64;
+        }
+        d2
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dist_sq_i16_avx(q: __m256i, p: __m256i) -> u64 {
     let diff = _mm256_sub_epi16(q, p);
@@ -154,6 +204,7 @@ unsafe fn dist_sq_i16_avx(q: __m256i, p: __m256i) -> u64 {
     _mm_cvtsi128_si32(x32) as u64
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum_ps_avx(v: __m256) -> f32 {
     let x128 = _mm_add_ps(_mm256_extractf128_ps(v, 1), _mm256_castps256_ps128(v));

@@ -4,7 +4,6 @@ use std::io::{BufReader, BufWriter, Write};
 use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use rand::seq::SliceRandom;
-use std::sync::Arc;
 
 #[derive(Deserialize)]
 struct RawEntry {
