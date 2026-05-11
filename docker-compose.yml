@@ -1,5 +1,6 @@
 x-api-common: &api-common
-  build: .
+  image: luiis001/rinha-api-2026:latest
+  pull_policy: always
   volumes:
     - shared_sockets:/tmp/sockets
   networks:
@@ -45,7 +46,8 @@ services:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
-      - GOGC=1000
+      - GOGC=off
+      - GC_MODE=off
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
@@ -53,7 +55,8 @@ services:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
-      - GOGC=1000
+      - GOGC=off
+      - GC_MODE=off
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
