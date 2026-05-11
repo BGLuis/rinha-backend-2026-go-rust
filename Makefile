@@ -1,9 +1,10 @@
-.PHONY: build up down restart logs smoke test docker-push
+.PHONY: build up down restart logs smoke test docker-push docker-push-lb docker-push-all
 
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
 PWD = $(shell pwd)
-IMAGE_NAME = luiis001/rinha-api-2026:latest
+API_IMAGE = luiis001/rinha-api-2026:latest
+LB_IMAGE = luiis001/rinha-lb-2026:latest
 
 build:
 	$(DOCKER_COMPOSE) build
@@ -26,9 +27,15 @@ smoke:
 test:
 	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/test.js
 
-docker-push:
-	docker build -t $(IMAGE_NAME) .
-	docker push $(IMAGE_NAME)
+docker-push-api:
+	docker build -t $(API_IMAGE) .
+	docker push $(API_IMAGE)
+
+docker-push-lb:
+	docker build -f Dockerfile.lb -t $(LB_IMAGE) .
+	docker push $(LB_IMAGE)
+
+docker-push-all: docker-push-api docker-push-lb
 
 run-all: restart
 	sleep 5

@@ -47,7 +47,6 @@ services:
         limits:
           cpus: '0.15'
           memory: '30M'
-
   api1:
     <<: *api-common
     environment:
