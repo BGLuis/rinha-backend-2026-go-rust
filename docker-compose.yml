@@ -46,7 +46,7 @@ services:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
-      - GOGC=1000
+      - GOGC=off
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
@@ -54,7 +54,7 @@ services:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
-      - GOGC=1000
+      - GOGC=off
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
