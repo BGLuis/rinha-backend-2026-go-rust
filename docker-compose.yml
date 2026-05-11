@@ -14,7 +14,7 @@ x-api-common: &api-common
     resources:
       limits:
         cpus: '0.42'
-        memory: '165M'
+        memory: '150M'
 
 services:
   lb:
@@ -46,7 +46,7 @@ services:
       resources:
         limits:
           cpus: '0.12'
-          memory: '10M'
+          memory: '40M'
   api1:
     <<: *api-common
     environment:
