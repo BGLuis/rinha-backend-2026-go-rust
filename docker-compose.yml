@@ -17,10 +17,14 @@ x-api-common: &api-common
         memory: '160M'
 
 services:
-  haproxy:
-    image: haproxy:alpine
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
+    environment:
+      - PORT=9999
+      - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - shared_sockets:/tmp/sockets
     ports:
       - "9999:9999"
@@ -35,6 +39,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
@@ -64,14 +71,14 @@ services:
     platform: linux/amd64
     entrypoint: ["/bin/sh", "/warmup.sh"]
     environment:
-      - BASE_URL=http://haproxy:9999
+      - BASE_URL=http://lb:9999
       - READY_RETRIES=240
       - READY_SLEEP=0.25
       - WARMUP_ROUNDS=48
     volumes:
       - ./scripts/warmup.sh:/warmup.sh:ro
     depends_on:
-      - haproxy
+      - lb
     networks:
       - rinha-net
     deploy:
