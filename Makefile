@@ -24,7 +24,7 @@ smoke:
 	docker run --rm --network host -i $(K6_IMAGE) run - <test/smoke.js
 
 test:
-	docker run --rm --network host -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/test.js
+	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/test.js
 
 docker-push:
 	docker build -t $(IMAGE_NAME) .
