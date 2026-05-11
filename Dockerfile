@@ -1,5 +1,6 @@
 # --- Estágio Base Rust: Cache de Dependências ---
 FROM rust:1.82-slim-bookworm AS rust-env
+ARG TARGETARCH
 WORKDIR /build/rust_engine
 
 # Copia apenas o manifesto para cachear o download e compilação de crates
@@ -7,25 +8,39 @@ COPY rust_engine/Cargo.toml ./
 RUN mkdir src && echo "pub fn dummy() {}" > src/lib.rs && \
     mkdir -p src/bin && echo "fn main() {}" > src/bin/build_index.rs
 
-# Flags agressivas de hardware (SIMD/AVX2)
-ENV RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"
-
-# Baixa e compila dependências (camada pesada e estável)
-RUN cargo build --release && rm -rf src
+# Flags agressivas de hardware (SIMD/AVX2) apenas para x86_64
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+    export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
+    else \
+    export RUSTFLAGS="-C link-arg=-s"; \
+    fi && \
+    cargo build --release && rm -rf src
 
 # --- Estágio Builder Rust: Compilação da Lib ---
 FROM rust-env AS rust-builder
+ARG TARGETARCH
 COPY rust_engine/src ./src
 # Força o rebuild apenas do código da aplicação
-RUN touch src/lib.rs && cargo build --release
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+    export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
+    else \
+    export RUSTFLAGS="-C link-arg=-s"; \
+    fi && \
+    touch src/lib.rs && cargo build --release
 
 # --- Estágio Dataset: Geração do Index (v2) ---
 FROM rust-env AS dataset-builder
+ARG TARGETARCH
 # Mantemos o WORKDIR em /build/rust_engine onde o Cargo.toml já existe
 COPY resources/ ./resources/
 COPY rust_engine/src ./src
 # Gera o dataset.bin.
-RUN touch src/bin/build_index.rs && cargo run --release --bin build_index && ls -lh dataset.bin
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+    export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
+    else \
+    export RUSTFLAGS="-C link-arg=-s"; \
+    fi && \
+    touch src/bin/build_index.rs && cargo run --release --bin build_index && ls -lh dataset.bin
 
 # --- Estágio Builder Go: API com CGO ---
 FROM golang:1.22-bookworm AS go-builder
