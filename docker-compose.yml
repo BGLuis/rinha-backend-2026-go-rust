@@ -18,10 +18,10 @@ x-api-common: &api-common
         memory: '160M'
 
 services:
-  nginx:
-    image: nginx:alpine
+  haproxy:
+    image: haproxy:alpine
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - shared_sockets:/tmp/sockets
     ports:
       - "9999:9999"
