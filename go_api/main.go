@@ -16,6 +16,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -89,30 +90,24 @@ func loadConfig() {
 }
 
 func clamp(v float64) float32 {
-	if v < 0 {
-		return 0
-	}
-	if v > 1 {
-		return 1
-	}
+	if v < 0 { return 0 }
+	if v > 1 { return 1 }
 	return float32(v)
 }
 
 func round4(v float32) float32 {
-	if v == -1 {
-		return -1
-	}
+	if v == -1 { return -1 }
 	return float32(math.Round(float64(v)*10000) / 10000)
 }
 
 func fastHandler(ctx *fasthttp.RequestCtx) {
 	path := ctx.Path()
-	if len(path) == 6 && string(path) == "/ready" {
+	if len(path) == 6 && path[1] == 'r' { // /ready
 		ctx.SetStatusCode(200)
 		return
 	}
 
-	if len(path) == 12 && string(path) == "/fraud-score" && ctx.IsPost() {
+	if len(path) == 12 && path[1] == 'f' && ctx.IsPost() { // /fraud-score
 		body := ctx.PostBody()
 
 		amt, _ := jsonparser.GetFloat(body, "transaction", "amount")
@@ -134,8 +129,11 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 
 		known := false
 		jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-			if !known && string(value) == merchantId {
-				known = true
+			if !known {
+				val, _ := jsonparser.ParseString(value)
+				if val == merchantId {
+					known = true
+				}
 			}
 		}, "customer", "known_merchants")
 
@@ -156,7 +154,7 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		q[3] = round4(float32(reqHour) / 23.0)
 		q[4] = round4(float32(reqWeekday) / 6.0)
 
-		if lastTx == nil || string(lastTx) == "null" {
+		if lastTx == nil || len(lastTx) == 0 || (len(lastTx) == 4 && string(lastTx) == "null") {
 			q[5] = -1.0
 			q[6] = -1.0
 		} else {
@@ -192,7 +190,7 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		case 3: ctx.Write(resp3)
 		case 4: ctx.Write(resp4)
 		case 5: ctx.Write(resp5)
-		default: ctx.Write(resp0)
+		default: ctx.Write(resp3)
 		}
 		return
 	}
@@ -200,14 +198,13 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
 	loadConfig()
 
 	datasetPath := os.Getenv("DATASET_PATH")
-	if datasetPath == "" {
-		datasetPath = "dataset.bin"
-	}
+	if datasetPath == "" { datasetPath = "dataset.bin" }
 
-	// Pre-warm: pre-fault pages to avoid tail latency
+	// Pre-warm
 	f, err := os.Open(datasetPath)
 	if err == nil {
 		st, _ := f.Stat()
@@ -215,47 +212,37 @@ func main() {
 		if size > 0 {
 			data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 			if err == nil {
-				// Touch one byte per page (4KB)
 				var sum byte
 				for i := 0; i < len(data); i += 4096 {
 					sum ^= data[i]
 				}
-				// Use the sum to prevent optimization
 				if sum == 42 && time.Now().Unix() == 0 { log.Print(sum) }
-				syscall.Munmap(data)
 			}
 		}
-		f.Close()
 	}
 
 	cPath := C.CString(datasetPath)
 	res := C.init_engine(cPath)
-	if res < 0 {
-		log.Fatalf("error initializing rust engine: %d", res)
-	}
+	if res < 0 { log.Fatalf("error initializing rust engine: %d", res) }
 	C.free(unsafe.Pointer(cPath))
 
 	socketPath := os.Getenv("SOCKET_PATH")
-	if socketPath == "" {
-		socketPath = "/tmp/sockets/api.sock"
-	}
+	if socketPath == "" { socketPath = "/tmp/sockets/api.sock" }
 	os.Remove(socketPath)
 
 	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		log.Fatalf("error in net.Listen: %s", err)
-	}
+	if err != nil { log.Fatalf("error in net.Listen: %s", err) }
 	os.Chmod(socketPath, 0777)
 
-	debug.SetGCPercent(-1) // Disable GC for peak performance after warmup
+	debug.SetGCPercent(-1)
 
 	s := &fasthttp.Server{
 		Handler:               fastHandler,
 		NoDefaultServerHeader: true,
 		NoDefaultDate:         true,
 		NoDefaultContentType:  true,
+		Name:                  "rinha",
+		Concurrency:           1024,
 	}
-	if err := s.Serve(ln); err != nil {
-		log.Fatalf("error in Serve: %s", err)
-	}
+	if err := s.Serve(ln); err != nil { log.Fatalf("error in Serve: %s", err) }
 }

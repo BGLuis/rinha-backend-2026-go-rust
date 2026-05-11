@@ -1,5 +1,3 @@
-version: '3.8'
-
 x-api-common: &api-common
   build: .
   volumes:
