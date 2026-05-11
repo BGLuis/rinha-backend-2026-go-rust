@@ -85,7 +85,7 @@ services:
       resources:
         limits:
           cpus: "0.04"
-          memory: "12M"
+          memory: "10M"
     restart: "no"
 
 volumes:
