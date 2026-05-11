@@ -1,4 +1,4 @@
-name: 🚀 On push to main  
+name: 🚀 Build and Push  
 
 on:
   push:
@@ -6,95 +6,19 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 jobs:
-  test-and-tag:
-    name: 🧪 Run Tests & Decide Tag
-    runs-on: ubuntu-latest
-    outputs:
-      push_version_tag: ${{ steps.compare.outputs.push_version_tag }}
-      version_tag: ${{ steps.semantic_release.outputs.tag }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-          fetch-depth: 0
-
-      - name: Start services
-        run: make restart DOCKER_COMPOSE="docker compose"
-
-      - name: Wait for API to be ready
-        run: sleep 5
-
-      - name: Run Smoke Test
-        run: make smoke DOCKER_COMPOSE="docker compose"
-
-      - name: Run Load Test
-        run: make test DOCKER_COMPOSE="docker compose"
-
-      - name: Get previous score from cache
-        id: cache-score
-        uses: actions/cache@v4
-        with:
-          path: last_score.txt
-          key: rinha-score-${{ github.run_id }}
-          restore-keys: |
-            rinha-score-
-
-      - name: Compare Score
-        id: compare
-        run: |
-          CURRENT_SCORE=$(jq -r '.scoring.final_score' test/results.json)
-          echo "Current Score: $CURRENT_SCORE"
-          
-          if [ -f last_score.txt ]; then
-            PREVIOUS_SCORE=$(cat last_score.txt)
-          else
-            PREVIOUS_SCORE="-99999"
-          fi
-          echo "Previous Score: $PREVIOUS_SCORE"
-          
-          if (( $(echo "$CURRENT_SCORE >= $PREVIOUS_SCORE" | bc -l) )); then
-            echo "Score improved or remained the same."
-            echo "push_version_tag=true" >> $GITHUB_OUTPUT
-          else
-            echo "Score worsened."
-            echo "push_version_tag=false" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "$CURRENT_SCORE" > last_score.txt
-
-      - name: 🔖 Tag Release
-        id: semantic_release
-        if: steps.compare.outputs.push_version_tag == 'true'
-        uses: go-semantic-release/action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Stop services
-        if: always()
-        run: make down DOCKER_COMPOSE="docker compose"
-
   build-and-push-docker-image:
     name: 🐳 Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: test-and-tag
-    if: success()
-    outputs:
-      image_name: ${{ steps.docker_tags.outputs.image_name }}
-      semantic_tag: ${{ steps.get_tag.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
           fetch-depth: 0
-
-      - name: Set up .env file
-        run: cp .env.example .env || true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -109,34 +33,17 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch latest tag
-        id: get_tag
-        run: |
-          if [ "${{ needs.test-and-tag.outputs.push_version_tag }}" == "true" ]; then
-            # Try to use the tag from the previous job output first
-            TAG="${{ needs.test-and-tag.outputs.version_tag }}"
-            if [ -z "$TAG" ]; then
-              git fetch --tags --force
-              TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0-unreleased")
-            fi
-          else
-            TAG="latest"
-          fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-
       - name: Set Docker Tags
         id: docker_tags
         run: |
           IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/rinha-api-2026"
           IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
           
-          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          # Get short SHA for tagging
+          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           
-          TAGS="${IMAGE_NAME}:latest"
-          if [ "${{ needs.test-and-tag.outputs.push_version_tag }}" == "true" ]; then
-            TAGS="${TAGS},${IMAGE_NAME}:${{ steps.get_tag.outputs.tag }}"
-          fi
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "tags=${IMAGE_NAME}:latest,${IMAGE_NAME}:${SHA}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker images
         uses: docker/build-push-action@v5.1.0
@@ -146,40 +53,3 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.docker_tags.outputs.tags }}
-
-  update-submission-branch:
-    name: 🚀 Update Submission Branch
-    runs-on: ubuntu-latest
-    needs: [test-and-tag, build-and-push-docker-image]
-    if: needs.test-and-tag.outputs.push_version_tag == 'true'
-    steps:
-      - name: Checkout submission branch
-        uses: actions/checkout@v4
-        with:
-          ref: submission
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Update docker-compose.yml with new image tag
-        run: |
-          IMAGE_NAME="${{ needs.build-and-push-docker-image.outputs.image_name }}"
-          NEW_TAG="${{ needs.build-and-push-docker-image.outputs.semantic_tag }}"
-          FULL_IMAGE_URL="${IMAGE_NAME}:${NEW_TAG}"
-          
-          echo "Updating docker-compose.yml to use image: $FULL_IMAGE_URL"
-          sed -i -E "s|image: ${IMAGE_NAME}:.*|image: ${FULL_IMAGE_URL}|g" docker-compose.yml
-          git diff
-
-      - name: Verify changes and Push
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          git add docker-compose.yml
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit in docker-compose.yml. The tag was likely already correct."
-          else
-            echo "Changes detected in docker-compose.yml. Committing and pushing..."
-            git commit -m "chore: update image to ${{ needs.build-and-push-docker-image.outputs.semantic_tag }} after score improvement"
-            git push origin submission
-          fi
