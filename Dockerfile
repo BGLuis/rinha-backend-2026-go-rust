@@ -61,6 +61,6 @@ COPY resources/mcc_risk.json ./resources/
 
 # Configurações de runtime
 ENV DATASET_PATH=/app/dataset.bin
-ENV GOMAXPROCS=2
+ENV GOMAXPROCS=1
 
 CMD ["./rinha-api"]
