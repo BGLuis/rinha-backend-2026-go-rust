@@ -19,13 +19,13 @@ COPY rust_engine/src ./src
 # Força o rebuild apenas do código da aplicação
 RUN touch src/lib.rs && cargo build --release
 
-# --- Estágio Dataset: Geração do Index ---
+# --- Estágio Dataset: Geração do Index (v2) ---
 FROM rust-env AS dataset-builder
 # Mantemos o WORKDIR em /build/rust_engine onde o Cargo.toml já existe
-COPY resources/ /build/resources/
+COPY resources/ ./resources/
 COPY rust_engine/src ./src
-# Gera o dataset.bin. Ajustamos o caminho de saída se necessário no comando
-RUN touch src/bin/build_index.rs && cargo run --release --bin build_index
+# Gera o dataset.bin.
+RUN cargo run --release --bin build_index && ls -lh dataset.bin
 
 # --- Estágio Builder Go: API com CGO ---
 FROM golang:1.22-bookworm AS go-builder

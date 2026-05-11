@@ -1,6 +1,6 @@
 # Build artifacts
 rust_engine/target/
-bin/
+/bin/
 *.exe
 *.o
 *.a
