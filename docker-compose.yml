@@ -60,6 +60,28 @@ services:
       - GOMEMLIMIT=150MiB
       - GOMAXPROCS=1
 
+  warmup:
+    image: curlimages/curl:8.8.0
+    platform: linux/amd64
+    entrypoint: ["/bin/sh", "/warmup.sh"]
+    environment:
+      - BASE_URL=http://haproxy:9999
+      - READY_RETRIES=240
+      - READY_SLEEP=0.25
+      - WARMUP_ROUNDS=48
+    volumes:
+      - ./scripts/warmup.sh:/warmup.sh:ro
+    depends_on:
+      - haproxy
+    networks:
+      - rinha-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.04"
+          memory: "12M"
+    restart: "no"
+
 volumes:
   shared_sockets:
     driver: local
