@@ -21,16 +21,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start services
-        run: make restart
+        run: make restart DOCKER_COMPOSE="docker compose"
 
       - name: Wait for API to be ready
         run: sleep 5
 
       - name: Run Smoke Test
-        run: make smoke
+        run: make smoke DOCKER_COMPOSE="docker compose"
 
       - name: Run Load Test
-        run: make test
+        run: make test DOCKER_COMPOSE="docker compose"
 
       - name: Get previous score from cache
         id: cache-score
@@ -73,7 +73,7 @@ jobs:
 
       - name: Stop services
         if: always()
-        run: make down
+        run: make down DOCKER_COMPOSE="docker compose"
 
   build-and-push-docker-image:
     name: 🐳 Build and Push Docker Image
