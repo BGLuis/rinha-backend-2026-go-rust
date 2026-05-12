@@ -60,6 +60,18 @@ fn worker_loop(port: u16, backlog: i32, ring_qd: u32, upstreams: &[String]) -> s
     if uds_fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+
+    // Increase send buffer to avoid dropped FDs
+    let sndbuf: libc::c_int = 16 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            uds_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sndbuf as *const _ as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
     
     let mut up_addrs = Vec::with_capacity(upstreams.len());
     for ups in upstreams {
@@ -140,11 +152,22 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
             msg.msg_controllen = (*cmsg).cmsg_len;
         }
 
-        let res = libc::sendmsg(sock, &msg, 0);
-        if res < 0 {
+        let mut retries = 0;
+        loop {
+            let res = libc::sendmsg(sock, &msg, 0);
+            if res >= 0 {
+                break;
+            }
             let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                retries += 1;
+                if retries > 100 {
+                    break;
+                }
+                std::thread::yield_now();
+            } else {
                 eprintln!("sendmsg failed: {} (sock={}, fd_to_send={})", err, sock, fd_to_send);
+                break;
             }
         }
     }
