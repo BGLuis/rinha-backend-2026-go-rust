@@ -25,12 +25,14 @@ smoke:
 	docker run --rm --network host -i $(K6_IMAGE) run - <test/smoke.js
 
 test:
+	mkdir -p "$(PWD)/test"
 	touch "$(PWD)/test/results.json" && chmod 666 "$(PWD)/test/results.json"
-	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/test.js
+	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -w /test -i $(K6_IMAGE) run test.js
 
 heavy-test:
+	mkdir -p "$(PWD)/test"
 	touch "$(PWD)/test/results.json" && chmod 666 "$(PWD)/test/results.json"
-	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/heavyTests.js
+	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -w /test -i $(K6_IMAGE) run heavyTests.js
 
 docker-push-api:
 	docker build -t $(API_IMAGE) .
