@@ -58,7 +58,7 @@ fn main() {
         Entry { v_i16, meta, v_f32 }
     }).collect();
 
-    let k = 1024;
+    let k = 4096;
     println!("Clustering into {} clusters...", k);
     
     // Simple K-Means
@@ -66,6 +66,11 @@ fn main() {
     let mut centroids: Vec<[f32; 16]> = entries.choose_multiple(&mut rng, k)
         .map(|e| e.v_f32)
         .collect();
+
+    // Ensure we have exactly k centroids even if we have fewer entries (unlikely but safe)
+    while centroids.len() < k {
+        centroids.push([0.0f32; 16]);
+    }
 
     for iter in 0..10 {
         let next_centroids: Vec<([f64; 16], usize)> = entries.par_iter()
@@ -156,7 +161,7 @@ fn main() {
     // Header (64 bytes)
     let mut header = [0u32; 16];
     header[0] = 0x4E495452; // "NITR"
-    header[1] = 1; // version
+    header[1] = 2; // version 2 (SoA layout)
     header[2] = k as u32;
     header[3] = entries.len() as u32;
     
@@ -186,7 +191,8 @@ fn main() {
     let mut offsets = vec![0u32; k];
     for ki in 0..k {
         offsets[ki] = current_offset as u32;
-        current_offset += clusters[ki].len() * 36;
+        let num_blocks = (clusters[ki].len() + 7) / 8;
+        current_offset += num_blocks * 256; // 112 i16 dims + 8 padding i16 + 8 u32 meta = 224 + 32 bytes
     }
     let offsets_u8: &[u8] = unsafe {
         std::slice::from_raw_parts(offsets.as_ptr() as *const u8, k * 4)
@@ -203,17 +209,43 @@ fn main() {
     };
     writer.write_all(sizes_u8).unwrap();
 
-    // Data
+    // Data (Blocks of 8)
     for ki in 0..k {
-        for e in &clusters[ki] {
-            let v_u8: &[u8] = unsafe {
-                std::slice::from_raw_parts(e.v_i16.as_ptr() as *const u8, 32)
+        let cluster_entries = &clusters[ki];
+        let num_blocks = (cluster_entries.len() + 7) / 8;
+        for bi in 0..num_blocks {
+            let mut block_dims = [0i16; 128]; // 14 dims * 8 vectors = 112. Padded to 128 for alignment.
+            let mut block_meta = [0u32; 8];
+            
+            for i in 0..8 {
+                let idx = bi * 8 + i;
+                if idx < cluster_entries.len() {
+                    let e = cluster_entries[idx];
+                    for d in 0..14 {
+                        block_dims[d * 8 + i] = e.v_i16[d];
+                    }
+                    block_meta[i] = e.meta;
+                } else {
+                    // Padding: meta index 0x7FFFFFFF is a sentinel, distance will be large
+                    block_meta[i] = 0x7FFFFFFF; 
+                    for d in 0..14 {
+                        block_dims[d * 8 + i] = 32767; // Max i16 to push distance away
+                    }
+                }
+            }
+            
+            let dims_u8: &[u8] = unsafe {
+                std::slice::from_raw_parts(block_dims.as_ptr() as *const u8, 256 - 32)
             };
-            writer.write_all(v_u8).unwrap();
-            writer.write_all(&e.meta.to_ne_bytes()).unwrap();
+            writer.write_all(dims_u8).unwrap();
+            
+            let meta_u8: &[u8] = unsafe {
+                std::slice::from_raw_parts(block_meta.as_ptr() as *const u8, 32)
+            };
+            writer.write_all(meta_u8).unwrap();
         }
     }
 
     writer.flush().unwrap();
-    println!("Done! dataset.bin generated successfully.");
+    println!("Done! dataset.bin generated successfully with SoA blocks.");
 }

@@ -24,6 +24,8 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         
         let header = slice::from_raw_parts(mmap.as_ptr() as *const u32, 16);
         if header[0] != 0x4E495452 { return -4; }
+        if header[1] != 2 { return -5; } // Ensure version 2 (SoA)
+        
         let k = header[2] as usize;
         NUM_CLUSTERS = k;
         
@@ -50,66 +52,107 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
     let mut q = [0.0f32; 16];
     q[0..14].copy_from_slice(q_in);
 
-    // lossless i16 query
-    let mut q_i16 = [0i16; 16];
-    for d in 0..14 { q_i16[d] = (q[d] * 10000.0).round() as i16; }
-
     let centroids = CENTROIDS.unwrap();
     let num_k = NUM_CLUSTERS;
     let mmap_ptr = DATASET_MMAP.as_ref().unwrap().as_ptr();
     let offsets = OFFSETS.unwrap();
     let sizes = SIZES.unwrap();
 
-    let mut top_dists_u64 = [u64::MAX; 5];
+    let mut top_dists = [f32::MAX; 5];
     let mut top_labels = [0u32; 5];
     let mut top_indices = [u32::MAX; 5];
 
-    // 1. Find top-N nearest centroids (nprobe=4)
-    const NPROBE: usize = 4;
-    let mut best_centroids = [(f32::MAX, 0usize); NPROBE];
+    // 1. Fast Probe: find top 5 nearest centroids
+    const FAST_PROBE: usize = 5;
+    const FULL_PROBE: usize = 24;
     
-    for (ki, c) in centroids.iter().enumerate() {
-        let d2 = dist_sq_f32_arch(q.as_ptr(), c.as_ptr());
-        if d2 < best_centroids[NPROBE-1].0 {
-            let mut pos = NPROBE - 1;
-            while pos > 0 && d2 < best_centroids[pos-1].0 {
-                best_centroids[pos] = best_centroids[pos-1];
-                pos -= 1;
-            }
-            best_centroids[pos] = (d2, ki);
-        }
+    let mut centroid_dists = Vec::with_capacity(num_k);
+    for ki in 0..num_k {
+        let d2 = dist_sq_f32_arch(q.as_ptr(), centroids[ki].as_ptr());
+        centroid_dists.push((d2, ki));
+    }
+    centroid_dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    // 2. Scan top-5 clusters (Fast Probe)
+    for i in 0..FAST_PROBE {
+        let ki = centroid_dists[i].1;
+        scan_cluster_soa(ki, &q, mmap_ptr, offsets, sizes, &mut top_dists, &mut top_indices, &mut top_labels);
     }
 
-    // 2. Scan top-N clusters
-    for i in 0..NPROBE {
-        let ki = best_centroids[i].1;
-        scan_cluster(ki, q_i16.as_ptr(), mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
+    let sum_fraud: u32 = top_labels.iter().sum();
+    
+    // 3. Uncertainty Fallback (Full Probe)
+    if sum_fraud == 2 || sum_fraud == 3 {
+        for i in FAST_PROBE..FULL_PROBE {
+            let ki = centroid_dists[i].1;
+            scan_cluster_soa(ki, &q, mmap_ptr, offsets, sizes, &mut top_dists, &mut top_indices, &mut top_labels);
+        }
     }
 
     top_labels.iter().sum::<u32>() as i32
 }
 
 #[inline(always)]
-unsafe fn scan_cluster(ki: usize, q_i16: *const i16, mmap_ptr: *const u8, offsets: &[u32], sizes: &[u32], top_dists_u64: &mut [u64; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
+unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offsets: &[u32], sizes: &[u32], top_dists: &mut [f32; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
     let n = sizes[ki] as usize;
+    let num_blocks = (n + 7) / 8;
     let base_ptr = mmap_ptr.add(offsets[ki] as usize);
     
-    for i in 0..n {
-        let p_ptr = base_ptr.add(i * 36) as *const i16;
+    let q_simd: [__m256; 14] = [
+        _mm256_set1_ps(q[0]), _mm256_set1_ps(q[1]), _mm256_set1_ps(q[2]), _mm256_set1_ps(q[3]),
+        _mm256_set1_ps(q[4]), _mm256_set1_ps(q[5]), _mm256_set1_ps(q[6]), _mm256_set1_ps(q[7]),
+        _mm256_set1_ps(q[8]), _mm256_set1_ps(q[9]), _mm256_set1_ps(q[10]), _mm256_set1_ps(q[11]),
+        _mm256_set1_ps(q[12]), _mm256_set1_ps(q[13])
+    ];
+    let scale = _mm256_set1_ps(0.0001);
+
+    for bi in 0..num_blocks {
+        let block_ptr = base_ptr.add(bi * 256);
         
         #[cfg(target_arch = "x86_64")]
-        _mm_prefetch(base_ptr.add((i + 8) * 36) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(base_ptr.add((bi + 2) * 256) as *const i8, _MM_HINT_T0);
 
-        let d2 = dist_sq_i16_arch(q_i16, p_ptr);
+        let mut acc = _mm256_setzero_ps();
+        
+        // Dims 0-7
+        for d in 0..8 {
+            let v_i16 = _mm_loadu_si128(block_ptr.add(d * 16) as *const __m128i);
+            let v_f32 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16)), scale);
+            let diff = _mm256_sub_ps(v_f32, q_simd[d]);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
 
-        if d2 <= top_dists_u64[4] {
-            let meta_ptr = (p_ptr as *const u8).add(32) as *const u32;
-            let meta = *meta_ptr;
-            let label = (meta >> 31) & 1;
-            let index = meta & 0x7FFFFFFF;
-            
-            if d2 < top_dists_u64[4] || index < top_indices[4] {
-                insert_top5(d2, index, label, top_dists_u64, top_indices, top_labels);
+        // Early exit: if all 8 vectors are already worse than the current 5th best
+        let threshold = _mm256_set1_ps(top_dists[4]);
+        let mask = _mm256_cmp_ps(acc, threshold, _CMP_GT_OQ);
+        if _mm256_movemask_ps(mask) == 0xFF {
+            continue;
+        }
+
+        // Dims 8-13
+        for d in 8..14 {
+            let v_i16 = _mm_loadu_si128(block_ptr.add(d * 16) as *const __m128i);
+            let v_f32 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16)), scale);
+            let diff = _mm256_sub_ps(v_f32, q_simd[d]);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
+
+        // Final distances for the block
+        let dists: [f32; 8] = std::mem::transmute(acc);
+        let meta_ptr = block_ptr.add(256 - 32) as *const u32;
+        let metas = slice::from_raw_parts(meta_ptr, 8);
+
+        for i in 0..8 {
+            let d2 = dists[i];
+            if d2 <= top_dists[4] {
+                let meta = metas[i];
+                let label = (meta >> 31) & 1;
+                let index = meta & 0x7FFFFFFF;
+                if index != 0x7FFFFFFF { // Skip padding
+                    if d2 < top_dists[4] || index < top_indices[4] {
+                        insert_top5(d2, index, label, top_dists, top_indices, top_labels);
+                    }
+                }
             }
         }
     }
@@ -140,65 +183,6 @@ unsafe fn dist_sq_f32_arch(q: *const f32, p: *const f32) -> f32 {
     }
 }
 
-#[inline(always)]
-unsafe fn dist_to_bbox_i16_arch(q_i16: *const i16, bbox: &[i16; 32]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let q_simd = _mm256_loadu_si256(q_i16 as *const __m256i);
-        let b_min = _mm256_loadu_si256(bbox.as_ptr() as *const __m256i);
-        let b_max = _mm256_loadu_si256(bbox.as_ptr().add(16) as *const __m256i);
-        let zero = _mm256_setzero_si256();
-
-        let d1 = _mm256_sub_epi16(b_min, q_simd);
-        let d2 = _mm256_sub_epi16(q_simd, b_max);
-        let diff = _mm256_max_epi16(zero, _mm256_max_epi16(d1, d2));
-        dist_sq_i16_avx(diff, zero)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut d2 = 0u64;
-        for d in 0..14 {
-            let min = bbox[d];
-            let max = bbox[d + 16];
-            let q = *q_i16.add(d);
-            let diff = if q < min { (min - q) as i32 } else if q > max { (q - max) as i32 } else { 0 };
-            d2 += (diff * diff) as u64;
-        }
-        d2
-    }
-}
-
-#[inline(always)]
-unsafe fn dist_sq_i16_arch(q: *const i16, p: *const i16) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let q_simd = _mm256_loadu_si256(q as *const __m256i);
-        let p_simd = _mm256_loadu_si256(p as *const __m256i);
-        dist_sq_i16_avx(q_simd, p_simd)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut d2 = 0u64;
-        for d in 0..14 {
-            let diff = (*q.add(d) as i32) - (*p.add(d) as i32);
-            d2 += (diff * diff) as u64;
-        }
-        d2
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn dist_sq_i16_avx(q: __m256i, p: __m256i) -> u64 {
-    let diff = _mm256_sub_epi16(q, p);
-    let sq_i32 = _mm256_madd_epi16(diff, diff);
-    
-    let x128 = _mm_add_epi32(_mm256_extracti128_si256(sq_i32, 1), _mm256_castsi256_si128(sq_i32));
-    let x64 = _mm_add_epi32(x128, _mm_srli_si128(x128, 8));
-    let x32 = _mm_add_epi32(x64, _mm_srli_si128(x64, 4));
-    _mm_cvtsi128_si32(x32) as u64
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hsum_ps_avx(v: __m256) -> f32 {
@@ -209,7 +193,7 @@ unsafe fn hsum_ps_avx(v: __m256) -> f32 {
 }
 
 #[inline(always)]
-fn insert_top5(dist: u64, index: u32, label: u32, dists: &mut [u64; 5], indices: &mut [u32; 5], labels: &mut [u32; 5]) {
+fn insert_top5(dist: f32, index: u32, label: u32, dists: &mut [f32; 5], indices: &mut [u32; 5], labels: &mut [u32; 5]) {
     let mut pos = 0;
     while pos < 5 {
         if dist < dists[pos] || (dist == dists[pos] && index < indices[pos]) { break; }
