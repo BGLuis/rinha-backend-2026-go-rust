@@ -28,6 +28,10 @@ test:
 	touch "$(PWD)/test/results.json" && chmod 666 "$(PWD)/test/results.json"
 	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/test.js
 
+heavy-test:
+	touch "$(PWD)/test/results.json" && chmod 666 "$(PWD)/test/results.json"
+	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -i $(K6_IMAGE) run /test/heavyTests.js
+
 docker-push-api:
 	docker build -t $(API_IMAGE) .
 	docker push $(API_IMAGE)

@@ -27,14 +27,31 @@ export const options = {
 		select: 'roundRobin',
 	},
 	scenarios: {
-		default: {
-			executor: 'ramping-arrival-rate',
-			startRate: 1,
+		// Cenário 1: Carga Base Constante (Simula tráfego normal)
+		base_load: {
+			executor: 'constant-arrival-rate',
+			rate: 1000,
 			timeUnit: '1s',
+			duration: '120s',
+			preAllocatedVUs: 200,
+			maxVUs: 1500,
+		},
+		// Cenário 2: Picos Agressivos Paralelos (Stress e Elasticidade)
+		spike_load: {
+			executor: 'ramping-arrival-rate',
+			startRate: 0,
+			timeUnit: '1s',
+			startTime: '10s', // Inicia 10s após a base
 			preAllocatedVUs: 100,
-			maxVUs: 250,
-			gracefulStop: '10s',
-			stages: [{ duration: '120s', target: 900 }],
+			maxVUs: 4000,
+			stages: [
+				{ duration: '10s', target: 4000 }, // Pico rápido (Spike)
+				{ duration: '15s', target: 4000 }, // Sustenta o pico
+				{ duration: '15s', target: 1000 }, // Desce rápido
+				{ duration: '20s', target: 8000 }, // Tsunami (Stress extremo)
+				{ duration: '30s', target: 8000 }, // Sustenta o Tsunami
+				{ duration: '20s', target: 0 },    // Cooldown
+			],
 		},
 	},
 };
@@ -49,8 +66,8 @@ export function setup() {
 }
 
 export default function () {
-	const idx = exec.scenario.iterationInTest;
-	if (idx >= testData.length) return;
+	// Usa módulo para ciclar pelo array indefinidamente durante a carga agressiva
+	const idx = exec.scenario.iterationInTest % testData.length;
 	const entry = testData[idx];
 	const expectedApproved = entry.expected_approved;
 
@@ -169,7 +186,7 @@ export function handleSummary(data) {
 	};
 
 	return {
-		'test/results.json': JSON.stringify(result, null, 2),
-		//stdout: textSummary(data, { indent: ' ', enableColors: true }),
+		'/test/results.json': JSON.stringify(result, null, 2),
+		stdout: textSummary(data, { indent: ' ', enableColors: true }),
 	};
 }
