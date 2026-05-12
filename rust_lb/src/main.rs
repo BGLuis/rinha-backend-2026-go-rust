@@ -8,8 +8,8 @@ use io_uring::{IoUring, opcode, types};
 const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_BUF_SIZE: usize = 4096;
 const DEFAULT_BACKLOG: i32 = 8192;
-const DEFAULT_MAX_CONNS: usize = 2048;
-const DEFAULT_RING_QD: u32 = 4096;
+const DEFAULT_MAX_CONNS: usize = 8192;
+const DEFAULT_RING_QD: u32 = 8192;
 
 const CQE_F_MORE: u32 = 1 << 1;
 
