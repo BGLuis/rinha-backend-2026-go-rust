@@ -1,20 +1,28 @@
+# docker-compose.unlimited.yml
+# Remove as limitações para testes locais de alta performance
+# Uso: docker compose -f docker-compose.yml -f docker-compose.unlimited.yml up
+
 services:
   lb:
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
     deploy:
       resources:
         limits:
-          cpus: '8.0'
-          memory: '16G'
+          cpus: '2.0'
+          memory: '512M'
 
   api1: &api-unlimited
+    build: .
     environment:
       - GOMEMLIMIT=1GiB
-      - GOMAXPROCS=8
+      - GOMAXPROCS=4
     deploy:
       resources:
         limits:
-          cpus: '8.0'
-          memory: '16G'
+          cpus: '4.0'
+          memory: '2G'
 
   api2:
     <<: *api-unlimited
@@ -29,5 +37,5 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '8.0'
-          memory: '16G'
+          cpus: '1.0'
+          memory: '128M'
