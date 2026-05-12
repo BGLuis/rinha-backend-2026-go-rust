@@ -2,12 +2,19 @@
 set -e
 
 # Configurações de arquivos
-COMPOSE_FILE=${1:-docker-compose.yml}
+OVERRIDE_FILE=$1
 LOG_FILE="resource_usage.log"
 STATS_FILE="test_stats.log"
 
-echo "🚀 Iniciando stack usando $COMPOSE_FILE..."
-docker compose -f "$COMPOSE_FILE" up -d
+# Define os argumentos do compose. Sempre usa o base, e opcionalmente um override.
+COMPOSE_ARGS="-f docker-compose.yml"
+if [ -n "$OVERRIDE_FILE" ] && [ "$OVERRIDE_FILE" != "docker-compose.yml" ]; then
+    echo "🏗️ Usando override: $OVERRIDE_FILE"
+    COMPOSE_ARGS="$COMPOSE_ARGS -f $OVERRIDE_FILE"
+fi
+
+echo "🚀 Iniciando stack..."
+docker compose $COMPOSE_ARGS up -d
 
 echo "⏳ Aguardando warmup e estabilização (15s)..."
 sleep 15
@@ -17,9 +24,9 @@ echo "📊 Monitoramento iniciado em $(date)" > "$LOG_FILE"
 # Função para monitorar containers em background
 monitor_containers() {
   while true; do
-    CONTAINERS=$(docker compose -f "$COMPOSE_FILE" ps -q)
+    # Obtém IDs de todos os containers da stack atual
+    CONTAINERS=$(docker compose $COMPOSE_ARGS ps -q)
     if [ -n "$CONTAINERS" ]; then
-      # Coleta métricas básicas de CPU e Memória
       docker stats --no-stream --format "container={{.Name}},cpu={{.CPUPerc}},mem={{.MemUsage}},mem_perc={{.MemPerc}}" $CONTAINERS >> "$LOG_FILE" 2>/dev/null || true
     fi
     sleep 2
@@ -31,7 +38,6 @@ monitor_containers &
 MONITOR_PID=$!
 
 echo "🔥 Iniciando teste de carga (make test)..."
-# Executa os testes mas não interrompe o script em caso de falha (para limpar os recursos)
 make test || echo "⚠️ Os testes retornaram erro, mas continuarei para gerar as estatísticas."
 
 echo "🛑 Teste de carga finalizado. Parando monitoramento..."
@@ -41,7 +47,6 @@ wait $MONITOR_PID 2>/dev/null || true
 echo "📈 Gerando estatísticas em $STATS_FILE..."
 echo "--- Estatísticas de Uso de Recursos (Média e Máximo) ---" > "$STATS_FILE"
 
-# Processamento dos logs via awk para calcular médias e picos
 awk -F',' '
   /container=/ {
     split($1, a, "="); name=a[2];
@@ -67,11 +72,9 @@ awk -F',' '
 ' "$LOG_FILE" | sort >> "$STATS_FILE"
 
 echo "--------------------------------------------------------" >> "$STATS_FILE"
-
-# Exibe o resultado final no console
 cat "$STATS_FILE"
 
 echo "🧹 Desativando stack..."
-docker compose -f "$COMPOSE_FILE" down
+docker compose $COMPOSE_ARGS down
 
 echo "✅ Concluído! Resultados salvos em $STATS_FILE e $LOG_FILE"
