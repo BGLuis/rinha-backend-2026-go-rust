@@ -1,6 +1,5 @@
 x-api-common: &api-common
-  image: luiis001/rinha-api-2026:latest
-  pull_policy: always
+  build: .
   volumes:
     - shared_sockets:/tmp/sockets
   networks:
@@ -15,12 +14,13 @@ x-api-common: &api-common
     resources:
       limits:
         cpus: '0.22'
-        memory: '75M'
+        memory: '70M'
 
 services:
   lb:
-    image: luiis001/rinha-lb-2026:latest
-    pull_policy: always
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
     environment:
       - PORT=9999
       - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock,/tmp/sockets/api3.sock,/tmp/sockets/api4.sock
@@ -48,13 +48,15 @@ services:
       resources:
         limits:
           cpus: '0.10'
-          memory: '40M'
+          memory: '60M'
+
+  api1:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOGC=off
       - GC_MODE=off
-      - GOMEMLIMIT=140MiB
+      - GOMEMLIMIT=64MiB
       - GOMAXPROCS=1
 
   api2:
@@ -63,7 +65,25 @@ services:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOGC=off
       - GC_MODE=off
-      - GOMEMLIMIT=140MiB
+      - GOMEMLIMIT=64MiB
+      - GOMAXPROCS=1
+
+  api3:
+    <<: *api-common
+    environment:
+      - SOCKET_PATH=/tmp/sockets/api3.sock
+      - GOGC=off
+      - GC_MODE=off
+      - GOMEMLIMIT=64MiB
+      - GOMAXPROCS=1
+
+  api4:
+    <<: *api-common
+    environment:
+      - SOCKET_PATH=/tmp/sockets/api4.sock
+      - GOGC=off
+      - GC_MODE=off
+      - GOMEMLIMIT=64MiB
       - GOMAXPROCS=1
 
   warmup:
