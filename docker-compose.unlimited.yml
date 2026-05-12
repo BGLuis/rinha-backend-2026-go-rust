@@ -1,0 +1,33 @@
+services:
+  lb:
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: '16G'
+
+  api1: &api-unlimited
+    environment:
+      - GOMEMLIMIT=1GiB
+      - GOMAXPROCS=8
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: '16G'
+
+  api2:
+    <<: *api-unlimited
+
+  api3:
+    <<: *api-unlimited
+
+  api4:
+    <<: *api-unlimited
+
+  warmup:
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: '16G'
