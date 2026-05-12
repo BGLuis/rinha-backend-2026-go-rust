@@ -1,0 +1,11 @@
+Dicas para a edição de 2026:
+
+Faça o pré processamento das 3 milhões de referências: deixa elas num formato binário e builda a imagem docker com elas.
+
+Use SIMD (single instruction, multi data) onde der.
+
+Comece com VP tree ou IVF para busca vetorial – não use busca por força bruta.
+
+Instrumente cada parte do seu código e entenda onde está o gargalo. Arrume uma coisa de cada vez.
+
+Provavelmente, a primeira execução vai ter uma performance e/ou taxa de detecção horrível. Olhe o repositório das outras pessoas pra aprender como estão fazendo!

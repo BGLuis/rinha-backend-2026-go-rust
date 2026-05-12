@@ -1,0 +1,10 @@
+Monitoring started at Mon May 11 08:13:53 PM -03 2026
+Monitoring started at Mon May 11 08:17:56 PM -03 2026
+container=2026-lb-1,cpu=0.00%,mem=18.08MiB / 40MiB,mem_perc=45.20%
+container=2026-api1-1,cpu=0.00%,mem=7.664MiB / 150MiB,mem_perc=5.11%
+container=2026-api2-1,cpu=0.00%,mem=5.648MiB / 150MiB,mem_perc=3.77%
+container=2026-api3-1,cpu=0.00%,mem=5.656MiB / 150MiB,mem_perc=3.77%
+container=2026-lb-1,cpu=0.00%,mem=18.08MiB / 40MiB,mem_perc=45.20%
+container=2026-api1-1,cpu=0.01%,mem=7.664MiB / 150MiB,mem_perc=5.11%
+container=2026-api2-1,cpu=0.01%,mem=5.648MiB / 150MiB,mem_perc=3.77%
+container=2026-api3-1,cpu=0.00%,mem=5.656MiB / 150MiB,mem_perc=3.77%

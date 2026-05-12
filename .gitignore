@@ -1,0 +1,26 @@
+# Build artifacts
+rust_engine/target/
+/bin/
+*.exe
+*.o
+*.a
+rinha-api
+
+# Local generated files
+dataset.bin
+clusters_tmp/
+cluster_*.bin
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large dataset files (managed by LFS, but let's exclude local generated bin)
+# We want to commit references.json.gz but maybe not dataset.bin if it's generated?
+# Actually, the user might want dataset.bin in the repo. 
+# Let's keep dataset.bin in .gitignore if we generate it in Docker.
+# But SUBMISSION.md says only files needed to run. 
+# If we don't push to Docker Hub, we need the Dockerfile to generate it.
+
+# Ignore results
+test/results.json
