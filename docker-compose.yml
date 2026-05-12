@@ -1,5 +1,5 @@
 x-api-common: &api-common
-  image: ghcr.io/bgluis/rinha-api-2026:latest
+  image: luiis001/rinha-api-2026:latest
   volumes:
     - shared_sockets:/tmp/sockets
   networks:
@@ -18,7 +18,7 @@ x-api-common: &api-common
 
 services:
   lb:
-    image: ghcr.io/bgluis/rinha-lb-2026:latest
+    image: luiis001/rinha-lb-2026:latest
     environment:
       - PORT=9999
       - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock,/tmp/sockets/api3.sock,/tmp/sockets/api4.sock
