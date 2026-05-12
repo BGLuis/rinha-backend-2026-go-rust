@@ -14,8 +14,8 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        cpus: '0.42'
-        memory: '165M'
+        cpus: '0.34'
+        memory: '75M'
 
 services:
   lb:
@@ -23,7 +23,7 @@ services:
     pull_policy: always
     environment:
       - PORT=9999
-      - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock
+      - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock,/tmp/sockets/api3.sock,/tmp/sockets/api4.sock
     volumes:
       - shared_sockets:/tmp/sockets
     ports:
@@ -31,6 +31,8 @@ services:
     depends_on:
       - api1
       - api2
+      - api3
+      - api4
     networks:
       - rinha-net
     security_opt:
@@ -46,7 +48,7 @@ services:
       resources:
         limits:
           cpus: '0.12'
-          memory: '10M'
+          memory: '40M'
 
   api1:
     <<: *api-common
@@ -54,7 +56,7 @@ services:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOGC=off
       - GC_MODE=off
-      - GOMEMLIMIT=150MiB
+      - GOMEMLIMIT=70MiB
       - GOMAXPROCS=1
 
   api2:
@@ -63,7 +65,25 @@ services:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOGC=off
       - GC_MODE=off
-      - GOMEMLIMIT=150MiB
+      - GOMEMLIMIT=70MiB
+      - GOMAXPROCS=1
+
+  api3:
+    <<: *api-common
+    environment:
+      - SOCKET_PATH=/tmp/sockets/api3.sock
+      - GOGC=off
+      - GC_MODE=off
+      - GOMEMLIMIT=70MiB
+      - GOMAXPROCS=1
+
+  api4:
+    <<: *api-common
+    environment:
+      - SOCKET_PATH=/tmp/sockets/api4.sock
+      - GOGC=off
+      - GC_MODE=off
+      - GOMEMLIMIT=70MiB
       - GOMAXPROCS=1
 
   warmup:
