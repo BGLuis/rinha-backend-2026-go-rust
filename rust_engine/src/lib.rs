@@ -55,7 +55,6 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
     for d in 0..14 { q_i16[d] = (q[d] * 10000.0).round() as i16; }
 
     let centroids = CENTROIDS.unwrap();
-    let bboxes = BBOXES.unwrap();
     let num_k = NUM_CLUSTERS;
     let mmap_ptr = DATASET_MMAP.as_ref().unwrap().as_ptr();
     let offsets = OFFSETS.unwrap();
@@ -65,30 +64,26 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32) -> i32 {
     let mut top_labels = [0u32; 5];
     let mut top_indices = [u32::MAX; 5];
 
-    // 1. Find nearest centroid
-    let mut best_ki = 0;
-    let mut best_kd2 = f32::MAX;
+    // 1. Find top-N nearest centroids (nprobe=4)
+    const NPROBE: usize = 4;
+    let mut best_centroids = [(f32::MAX, 0usize); NPROBE];
+    
     for (ki, c) in centroids.iter().enumerate() {
         let d2 = dist_sq_f32_arch(q.as_ptr(), c.as_ptr());
-        if d2 < best_kd2 {
-            best_kd2 = d2;
-            best_ki = ki;
+        if d2 < best_centroids[NPROBE-1].0 {
+            let mut pos = NPROBE - 1;
+            while pos > 0 && d2 < best_centroids[pos-1].0 {
+                best_centroids[pos] = best_centroids[pos-1];
+                pos -= 1;
+            }
+            best_centroids[pos] = (d2, ki);
         }
     }
 
-    // 2. Scan best cluster
-    scan_cluster(best_ki, q_i16.as_ptr(), mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
-
-    // 3. Exhaustive search with BBox Pruning (Integer Exact)
-    for ki in 0..num_k {
-        if ki == best_ki { continue; }
-        
-        let bbox = &bboxes[ki];
-        let min_d2_u64 = dist_to_bbox_i16_arch(q_i16.as_ptr(), bbox);
-        
-        if min_d2_u64 <= top_dists_u64[4] {
-            scan_cluster(ki, q_i16.as_ptr(), mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
-        }
+    // 2. Scan top-N clusters
+    for i in 0..NPROBE {
+        let ki = best_centroids[i].1;
+        scan_cluster(ki, q_i16.as_ptr(), mmap_ptr, offsets, sizes, &mut top_dists_u64, &mut top_indices, &mut top_labels);
     }
 
     top_labels.iter().sum::<u32>() as i32
