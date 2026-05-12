@@ -69,17 +69,16 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, _unused: i32) -> i
     let mut top_labels = [0u32; 5];
     let mut top_indices = [u32::MAX; 5];
 
-    // 1. Find nearest centroids (Sort is often faster than complex manual insertion for small k)
+    // 1. Find nearest centroids (Sort is fast for small K)
     let mut centroid_dists: Vec<(f32, usize)> = (0..num_k)
         .map(|ki| (dist_sq_f32_arch(q.as_ptr(), centroids[ki].as_ptr()), ki))
         .collect();
     centroid_dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    // 2. Scan top-8 clusters with BBox Pruning (8 is a good balance for accuracy/speed)
-    for i in 0..8 {
+    // 2. ABSOLUTE BRUTE FORCE: Scan ALL clusters to ensure 0.00% failure rate
+    for i in 0..num_k {
         let ki = centroid_dists[i].1;
-        let min_d2 = min_dist_to_bbox(&q, &bboxes[ki]);
-        if min_d2 > top_dists[4] { continue; }
+        // No BBox pruning - read every single vector in the dataset
         scan_cluster_soa(ki, &q, mmap_ptr, offsets, sizes, &mut top_dists, &mut top_indices, &mut top_labels);
     }
 

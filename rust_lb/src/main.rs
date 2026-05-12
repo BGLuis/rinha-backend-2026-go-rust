@@ -18,10 +18,10 @@ pub fn run() -> std::io::Result<()> {
     let port = env_u32("PORT", DEFAULT_PORT as u32) as u16;
     let backlog = env_u32("BACKLOG", DEFAULT_BACKLOG as u32) as i32;
     let ring_qd = env_u32("RING_QD", DEFAULT_RING_QD);
-    
+
     let upstream_str = std::env::var("UPSTREAMS")
         .unwrap_or_else(|_| "/tmp/sockets/api.sock".to_string());
-    
+
     let upstreams: Vec<String> = upstream_str.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -30,13 +30,13 @@ pub fn run() -> std::io::Result<()> {
     if upstreams.is_empty() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "No upstreams provided"));
     }
-    
+
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    
+
     eprintln!("lb listen=:{} backlog={} upstreams={:?} cores={}", port, backlog, upstreams, cores);
 
     let mut handles = Vec::new();
-    
+
     for _ in 0..cores {
         let ups = upstreams.clone();
         handles.push(thread::spawn(move || {
@@ -47,7 +47,7 @@ pub fn run() -> std::io::Result<()> {
     for h in handles {
         let _ = h.join();
     }
-    
+
     Ok(())
 }
 
@@ -55,7 +55,7 @@ fn worker_loop(port: u16, backlog: i32, ring_qd: u32, upstreams: &[String]) -> s
     let listen_fd = create_listener(port, backlog)?;
     let mut ring: IoUring = IoUring::builder()
         .build(ring_qd)?;
-        
+
     let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
     if uds_fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -72,7 +72,7 @@ fn worker_loop(port: u16, backlog: i32, ring_qd: u32, upstreams: &[String]) -> s
             mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
-    
+
     let mut up_addrs = Vec::with_capacity(upstreams.len());
     for ups in upstreams {
         let mut c_path = ups.clone();
@@ -105,7 +105,7 @@ fn worker_loop(port: u16, backlog: i32, ring_qd: u32, upstreams: &[String]) -> s
         for cqe in cqes.drain(..) {
             let res = cqe.result();
             let flags = cqe.flags();
-            
+
             if (flags & CQE_F_MORE) == 0 {
                 push_accept(&mut ring, listen_fd);
             }
@@ -114,12 +114,12 @@ fn worker_loop(port: u16, backlog: i32, ring_qd: u32, upstreams: &[String]) -> s
             }
             let client_fd = res as RawFd;
             set_tcp_nodelay(client_fd);
-            
+
             let target_addr = &up_addrs[rr % up_addrs.len()];
             rr = rr.wrapping_add(1);
-            
+
             send_fd(uds_fd, target_addr, client_fd);
-            
+
             unsafe { libc::close(client_fd); }
         }
     }
