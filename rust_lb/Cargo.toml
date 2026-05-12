@@ -1,8 +1,0 @@
-[package]
-name = "rust_lb"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-io-uring = "0.6"
-libc = "0.2"

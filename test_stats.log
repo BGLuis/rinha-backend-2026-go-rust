@@ -1,2 +1,0 @@
-CONTAINER ID   NAME        CPU %     MEM USAGE / LIMIT   MEM %     NET I/O           BLOCK I/O   PIDS
-c11ab4df436f   2026-lb-1   0.00%     18.08MiB / 40MiB    45.20%    38.3MB / 10.2MB   0B / 0B     1

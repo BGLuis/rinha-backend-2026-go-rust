@@ -9,7 +9,7 @@
     "stack": [
         "go",
         "rust",
-        "nginx",
+        "rust-lb",
         "docker",
         "ivf-vector-search"
     ],
