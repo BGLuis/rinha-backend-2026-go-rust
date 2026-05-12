@@ -14,7 +14,7 @@ x-api-common: &api-common
     resources:
       limits:
         cpus: '0.44'
-        memory: '140M'
+        memory: '150M'
 
 services:
   lb:
@@ -54,7 +54,7 @@ services:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOGC=off
       - GC_MODE=off
-      - GOMEMLIMIT=130MiB
+      - GOMEMLIMIT=140MiB
       - GOMAXPROCS=1
 
   api2:
@@ -63,7 +63,7 @@ services:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOGC=off
       - GC_MODE=off
-      - GOMEMLIMIT=130MiB
+      - GOMEMLIMIT=140MiB
       - GOMAXPROCS=1
 
   warmup:
