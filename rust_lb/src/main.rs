@@ -7,9 +7,9 @@ use io_uring::{IoUring, opcode, types};
 
 const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_BUF_SIZE: usize = 4096;
-const DEFAULT_BACKLOG: i32 = 4096;
-const MAX_CONNS: usize = 2048;
-const RING_QD: u32 = 4096;
+const DEFAULT_BACKLOG: i32 = 8192;
+const DEFAULT_MAX_CONNS: usize = 2048;
+const DEFAULT_RING_QD: u32 = 4096;
 
 const CQE_F_MORE: u32 = 1 << 1;
 
@@ -108,6 +108,9 @@ pub fn run() -> std::io::Result<()> {
     let port = env_u32("PORT", DEFAULT_PORT as u32) as u16;
     let buf_size = env_usize("BUF_SIZE", DEFAULT_BUF_SIZE).max(512);
     let backlog = env_u32("BACKLOG", DEFAULT_BACKLOG as u32) as i32;
+    let max_conns = env_usize("MAX_CONNS", DEFAULT_MAX_CONNS);
+    let ring_qd = env_u32("RING_QD", DEFAULT_RING_QD);
+
     let upstream_str = std::env::var("UPSTREAMS")
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "UPSTREAMS env required"))?;
 
@@ -126,28 +129,29 @@ pub fn run() -> std::io::Result<()> {
         .setup_coop_taskrun()
         .setup_defer_taskrun()
         .setup_taskrun_flag()
-        .build(RING_QD)?;
+        .build(ring_qd)?;
 
     eprintln!(
-        "lb listen=:{} buf={} backlog={} upstreams=[{}] (io_uring qd={})",
+        "lb listen=:{} buf={} backlog={} max_conns={} upstreams=[{}] (io_uring qd={})",
         port,
         buf_size,
         backlog,
+        max_conns,
         upstreams
             .iter()
             .map(|u| u.path.as_str())
             .collect::<Vec<_>>()
             .join(", "),
-        RING_QD,
+        ring_qd,
     );
 
-    let mut conns: Vec<Conn> = (0..MAX_CONNS).map(|_| Conn::new(buf_size)).collect();
-    let mut free_slots: Vec<u32> = (0..MAX_CONNS as u32).rev().collect();
+    let mut conns: Vec<Conn> = (0..max_conns).map(|_| Conn::new(buf_size)).collect();
+    let mut free_slots: Vec<u32> = (0..max_conns as u32).rev().collect();
     let mut rr: usize = 0;
 
     push_accept(&mut ring, listen_fd);
 
-    let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(RING_QD as usize);
+    let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::with_capacity(ring_qd as usize);
 
     loop {
         ring.submit_and_wait(1)?;
@@ -406,8 +410,7 @@ fn push_connect(
     slot: usize,
     gen_id: u32,
     fd: RawFd,
-    up: &Upstream,
-) {
+    up: &Upstream) {
     let sqe = opcode::Connect::new(
         types::Fd(fd),
         &up.addr as *const _ as *const libc::sockaddr,

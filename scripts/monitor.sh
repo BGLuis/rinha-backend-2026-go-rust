@@ -18,7 +18,6 @@ docker compose $COMPOSE_ARGS up -d
 
 echo "⏳ Aguardando warmup dinâmico concluir..."
 START_WARMUP=$(date +%s)
-# Tenta aguardar o container warmup sair (docker compose wait existe na v2)
 WARMUP_EXIT_CODE=$(docker compose $COMPOSE_ARGS wait warmup | awk '{print $NF}' || echo "failed")
 END_WARMUP=$(date +%s)
 DURATION_WARMUP=$((END_WARMUP - START_WARMUP))
@@ -27,26 +26,22 @@ if [ "$WARMUP_EXIT_CODE" = "0" ]; then
     echo "✅ Warmup finalizado com sucesso em ${DURATION_WARMUP}s."
 else
     echo "⚠️ Warmup finalizado com erro ou timeout (Exit Code: $WARMUP_EXIT_CODE) após ${DURATION_WARMUP}s."
-    echo "--- Últimas 5 linhas do log de Warmup ---"
     docker compose $COMPOSE_ARGS logs warmup --tail 5
 fi
 
 echo "📊 Monitoramento iniciado em $(date)" > "$LOG_FILE"
 
-# Função para monitorar containers em background
 monitor_containers() {
   while true; do
-    # Obtém IDs de todos os containers da stack atual
     CONTAINERS=$(docker compose $COMPOSE_ARGS ps -q)
     if [ -n "$CONTAINERS" ]; then
-      # Coleta métricas de CPU, Memória, Rede e Disco
-      docker stats --no-stream --format "container={{.Name}},cpu={{.CPUPerc}},mem={{.MemUsage}},mem_perc={{.MemPerc}},net={{.NetIO}},block={{.BlockIO}}" $CONTAINERS >> "$LOG_FILE" 2>/dev/null || true
+      # Formato robusto para evitar quebras de parsing
+      docker stats --no-stream --format "{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.NetIO}},{{.BlockIO}}" $CONTAINERS >> "$LOG_FILE" 2>/dev/null || true
     fi
     sleep 2
   done
 }
 
-# Inicia monitoramento em background
 monitor_containers &
 MONITOR_PID=$!
 
@@ -60,17 +55,18 @@ wait $MONITOR_PID 2>/dev/null || true
 echo "📈 Gerando estatísticas em $STATS_FILE..."
 echo "--- Estatísticas de Uso de Recursos (Média e Máximo) ---" > "$STATS_FILE"
 
+# Parsing robusto do CSV gerado pelo docker stats
 awk -F',' '
-  /container=/ {
-    split($1, a, "="); name=a[2];
-    split($2, b, "="); cpu=b[2]; sub("%", "", cpu);
-    split($4, c, "="); mem=c[2]; sub("%", "", mem);
+  {
+    name=$1;
+    cpu=$2; sub("%", "", cpu);
+    mem_p=$4; sub("%", "", mem_p);
     
-    if (cpu != "") {
+    if (cpu ~ /^[0-9.]+$/) {
       cpu_sum[name] += cpu;
-      if (cpu > cpu_max[name]) cpu_max[name] = cpu;
-      mem_sum[name] += mem;
-      if (mem > mem_max[name]) mem_max[name] = mem;
+      if (cpu > cpu_max[name] || cpu_max[name] == "") cpu_max[name] = cpu;
+      mem_sum[name] += mem_p;
+      if (mem_p > mem_max[name] || mem_max[name] == "") mem_max[name] = mem_p;
       count[name]++;
     }
   }
@@ -85,42 +81,26 @@ awk -F',' '
 ' "$LOG_FILE" | sort >> "$STATS_FILE"
 
 echo "--------------------------------------------------------" >> "$STATS_FILE"
-
-# --- Diagnósticos de Erros e Saúde ---
 echo "🔍 Diagnósticos de Saúde e Logs:" >> "$STATS_FILE"
 
-# Verifica se containers morreram
 EXITED_CONTAINERS=$(docker compose $COMPOSE_ARGS ps -a --format "{{.Name}}: {{.Status}}" | grep -E "Exited|Dead" || true)
 if [ -n "$EXITED_CONTAINERS" ]; then
-    echo "🚨 ATENÇÃO: Os seguintes containers finalizaram inesperadamente:" >> "$STATS_FILE"
+    echo "🚨 ATENÇÃO: Containers que finalizaram:" >> "$STATS_FILE"
     echo "$EXITED_CONTAINERS" >> "$STATS_FILE"
 else
-    echo "✅ Todos os containers principais permaneceram ativos." >> "$STATS_FILE"
+    echo "✅ Todos os containers permaneceram ativos." >> "$STATS_FILE"
 fi
 
-# Scrape de erros nos logs
-echo "--- Resumo de Erros Encontrados nos Logs (Load Balancer & APIs) ---" >> "$STATS_FILE"
-ERROR_LOGS=$(docker compose $COMPOSE_ARGS logs --tail 1000 | grep -Ei "error|panic|fatal|out of memory|oom-kill" | grep -v "warmup" | tail -n 10 || true)
-if [ -n "$ERROR_LOGS" ]; then
-    echo "$ERROR_LOGS" >> "$STATS_FILE"
-else
-    echo "Nenhum erro crítico (panic/oom) detectado nos logs recentes." >> "$STATS_FILE"
-fi
+echo "--- Resumo de Erros nos Logs ---" >> "$STATS_FILE"
+docker compose $COMPOSE_ARGS logs --tail 1000 | grep -Ei "error|panic|fatal|out of memory|oom-kill" | grep -v "warmup" | tail -n 10 >> "$STATS_FILE" || true
 echo "--------------------------------------------------------" >> "$STATS_FILE"
 
-# --- Integração do Score Final ---
 if [ -f "test/results.json" ]; then
-    echo "🏆 Score Final (Extraído de test/results.json):" >> "$STATS_FILE"
-    # Extrai campos específicos do JSON usando python (já que costuma estar presente em distros linux) ou grep/sed simples
-    # Vou usar awk/sed simples para não depender de ferramentas extras
+    echo "🏆 Score Final:" >> "$STATS_FILE"
     grep -E "\"p99\"|\"failure_rate\"|\"final_score\"" test/results.json | sed 's/[",]//g' >> "$STATS_FILE" || true
     echo "--------------------------------------------------------" >> "$STATS_FILE"
 fi
 
-# Exibe o resultado final resumido no console
 cat "$STATS_FILE"
-
-echo "🧹 Desativando stack..."
 docker compose $COMPOSE_ARGS down
-
-echo "✅ Concluído! Resultados salvos em $STATS_FILE e $LOG_FILE"
+echo "✅ Concluído!"

@@ -1,9 +1,11 @@
 # docker-compose.unlimited.yml
 # Remove as limitações para testes locais de alta performance
-# Uso: docker compose -f docker-compose.yml -f docker-compose.unlimited.yml up
 
 services:
   lb:
+    environment:
+      - MAX_CONNS=16384
+      - RING_QD=8192
     deploy:
       resources:
         limits:
