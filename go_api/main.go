@@ -275,6 +275,9 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 		q := queryPool.Get().(*[14]float32)
 		fastVectorize(body, q)
 
+		frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+		queryPool.Put(q)
+
 		ctx.SetContentType("application/json")
 		switch frauds {
 		case 0:
