@@ -28,9 +28,6 @@ services:
   api3:
     <<: *api-unlimited
 
-  api4:
-    <<: *api-unlimited
-
   warmup:
     deploy:
       resources:
