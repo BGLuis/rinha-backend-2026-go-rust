@@ -1,7 +1,7 @@
 package main
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../rust_engine/target/release -lrust_engine -lm -ldl
+#cgo LDFLAGS: -L/usr/local/lib -lrust_engine -lm -ldl
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -56,13 +57,9 @@ var queryPool = sync.Pool{
 	},
 }
 
-var GroundTruth map[string]bool
-
 func loadConfig() {
-	gtData, _ := os.ReadFile("test/ground-truth.json")
-	json.Unmarshal(gtData, &GroundTruth)
-	
-	normData, _ := os.ReadFile("resources/normalization.json")
+	normData, err := os.ReadFile("resources/normalization.json")
+	if err != nil { log.Fatalf("err: %v", err) }
 	var norm struct {
 		MaxAmount            float64 `json:"max_amount"`
 		MaxInstallments      float64 `json:"max_installments"`
@@ -84,111 +81,116 @@ func loadConfig() {
 	for i := range MccRiskArr {
 		MccRiskArr[i] = 0.5
 	}
-	mccData, _ := os.ReadFile("resources/mcc_risk.json")
-	var mccMap map[string]float64
-	json.Unmarshal(mccData, &mccMap)
-	for k, v := range mccMap {
-		m, _ := strconv.Atoi(k)
-		if m < 10000 {
-			MccRiskArr[m] = float32(v)
+	mccData, err := os.ReadFile("resources/mcc_risk.json")
+	if err == nil {
+		var mccMap map[string]float64
+		json.Unmarshal(mccData, &mccMap)
+		for k, v := range mccMap {
+			m, _ := strconv.Atoi(k)
+			if m < 10000 {
+				MccRiskArr[m] = float32(v)
+			}
 		}
 	}
 }
 
 func clamp(v float64) float32 {
-	if v < 0 {
-		return 0
-	}
-	if v > 1 {
-		return 1
-	}
+	if v < 0 { return 0 }
+	if v > 1 { return 1 }
 	return float32(v)
 }
 
 func round4(v float32) float32 {
-	if v == -1 {
-		return -1
-	}
+	if v == -1 { return -1 }
 	return float32(math.Round(float64(v)*10000) / 10000)
 }
 
-// Manual RFC3339 parser for "2026-03-11T18:45:53Z"
-func fastParseTime(s string) time.Time {
+func fastParseTime(s []byte) time.Time {
+	if len(s) >= 2 && s[0] == '"' {
+		s = s[1 : len(s)-1]
+	}
 	if len(s) < 19 {
 		return time.Time{}
 	}
-	year, _ := strconv.Atoi(s[0:4])
-	month, _ := strconv.Atoi(s[5:7])
-	day, _ := strconv.Atoi(s[8:10])
-	hour, _ := strconv.Atoi(s[11:13])
-	min, _ := strconv.Atoi(s[14:16])
-	sec, _ := strconv.Atoi(s[17:19])
+	year := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+	month := int(s[5]-'0')*10 + int(s[6]-'0')
+	day := int(s[8]-'0')*10 + int(s[9]-'0')
+	hour := int(s[11]-'0')*10 + int(s[12]-'0')
+	min := int(s[14]-'0')*10 + int(s[15]-'0')
+	sec := int(s[17]-'0')*10 + int(s[18]-'0')
 	return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
 }
 
-func fastVectorize(body []byte, q *[14]float32) int32 {
-	var (
-		amt, cAvgAmt, mAvgAmt, kmHome float64
-		inst, txCount                int64
-		reqAtStr, mccStr             string
-		merchantId                   []byte
-		isOnline, cardPresent        bool
-	)
+var jsonPaths = [][]string{
+	{"transaction", "amount"},           // 0
+	{"transaction", "installments"},     // 1
+	{"transaction", "requested_at"},      // 2
+	{"customer", "avg_amount"},          // 3
+	{"customer", "tx_count_24h"},        // 4
+	{"customer", "known_merchants"},     // 5
+	{"merchant", "id"},                  // 6
+	{"merchant", "mcc"},                 // 7
+	{"merchant", "avg_amount"},          // 8
+	{"terminal", "is_online"},           // 9
+	{"terminal", "card_present"},        // 10
+	{"terminal", "km_from_home"},         // 11
+	{"last_transaction", "timestamp"},    // 12
+	{"last_transaction", "km_from_current"}, // 13
+}
 
-	paths := [][]string{
-		{"transaction", "amount"},
-		{"transaction", "installments"},
-		{"transaction", "requested_at"},
-		{"customer", "avg_amount"},
-		{"customer", "tx_count_24h"},
-		{"merchant", "id"},
-		{"merchant", "mcc"},
-		{"merchant", "avg_amount"},
-		{"terminal", "is_online"},
-		{"terminal", "card_present"},
-		{"terminal", "km_from_home"},
-	}
+var nullBytes = []byte("null")
+
+func fastVectorize(body []byte, q *[14]float32) {
+	var (
+		amt, cAvgAmt, mAvgAmt, kmHome, kmLast float64
+		inst, txCount                         int64
+		reqAtBytes, mccBytes, merchantsBytes  []byte
+		merchantId                            []byte
+		lastTsBytes                           []byte
+		isOnline, cardPresent                 bool
+		hasLastTx                             bool
+	)
 
 	jsonparser.EachKey(body, func(idx int, value []byte, dataType jsonparser.ValueType, err error) {
 		switch idx {
-		case 0:
-			amt, _ = jsonparser.ParseFloat(value)
-		case 1:
-			inst, _ = jsonparser.ParseInt(value)
-		case 2:
-			reqAtStr, _ = jsonparser.ParseString(value)
-		case 3:
-			cAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 4:
-			txCount, _ = jsonparser.ParseInt(value)
-		case 5:
+		case 0: amt, _ = jsonparser.ParseFloat(value)
+		case 1: inst, _ = jsonparser.ParseInt(value)
+		case 2: reqAtBytes = value
+		case 3: cAvgAmt, _ = jsonparser.ParseFloat(value)
+		case 4: txCount, _ = jsonparser.ParseInt(value)
+		case 5: merchantsBytes = value
+		case 6:
 			if len(value) >= 2 && value[0] == '"' {
 				merchantId = value[1 : len(value)-1]
 			} else {
 				merchantId = value
 			}
-		case 6:
-			mccStr, _ = jsonparser.ParseString(value)
-		case 7:
-			mAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 8:
-			isOnline, _ = jsonparser.ParseBoolean(value)
-		case 9:
-			cardPresent, _ = jsonparser.ParseBoolean(value)
-		case 10:
-			kmHome, _ = jsonparser.ParseFloat(value)
+		case 7: mccBytes = value
+		case 8: mAvgAmt, _ = jsonparser.ParseFloat(value)
+		case 9: isOnline, _ = jsonparser.ParseBoolean(value)
+		case 10: cardPresent, _ = jsonparser.ParseBoolean(value)
+		case 11: kmHome, _ = jsonparser.ParseFloat(value)
+		case 12: lastTsBytes = value; hasLastTx = true
+		case 13: kmLast, _ = jsonparser.ParseFloat(value)
 		}
-	}, paths...)
+	}, jsonPaths...)
 
-	lastTx, _, _, _ := jsonparser.Get(body, "last_transaction")
 	known := false
-	jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-		if !known && bytes.Equal(value, merchantId) {
-			known = true
-		}
-	}, "customer", "known_merchants")
+	if merchantsBytes != nil {
+		jsonparser.ArrayEach(merchantsBytes, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+			if !known {
+				v := value
+				if len(v) >= 2 && v[0] == '"' {
+					v = v[1 : len(v)-1]
+				}
+				if bytes.Equal(v, merchantId) {
+					known = true
+				}
+			}
+		})
+	}
 
-	reqAt := fastParseTime(reqAtStr)
+	reqAt := fastParseTime(reqAtBytes)
 	reqHour := reqAt.Hour()
 	reqWeekday := int(reqAt.Weekday()+6) % 7
 
@@ -202,13 +204,11 @@ func fastVectorize(body []byte, q *[14]float32) int32 {
 	q[3] = round4(float32(reqHour) / 23.0)
 	q[4] = round4(float32(reqWeekday) / 6.0)
 
-	if lastTx == nil || len(lastTx) == 0 || bytes.Equal(lastTx, []byte("null")) {
+	if !hasLastTx || lastTsBytes == nil || len(lastTsBytes) == 0 || bytes.Equal(lastTsBytes, nullBytes) {
 		q[5] = -1.0
 		q[6] = -1.0
 	} else {
-		lastTsStr, _ := jsonparser.GetString(lastTx, "timestamp")
-		kmLast, _ := jsonparser.GetFloat(lastTx, "km_from_current")
-		lastTs := fastParseTime(lastTsStr)
+		lastTs := fastParseTime(lastTsBytes)
 		minutes := float64(reqAt.Unix()-lastTs.Unix()) / 60.0
 		q[5] = round4(clamp(minutes / MaxMinutes))
 		q[6] = round4(clamp(kmLast / MaxKm))
@@ -216,36 +216,22 @@ func fastVectorize(body []byte, q *[14]float32) int32 {
 
 	q[7] = round4(clamp(kmHome / MaxKm))
 	q[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
-	if isOnline {
-		q[9] = 1.0
-	} else {
-		q[9] = 0.0
-	}
-	if cardPresent {
-		q[10] = 1.0
-	} else {
-		q[10] = 0.0
-	}
-	if !known {
-		q[11] = 1.0
-	} else {
-		q[11] = 0.0
-	}
+	if isOnline { q[9] = 1.0 } else { q[9] = 0.0 }
+	if cardPresent { q[10] = 1.0 } else { q[10] = 0.0 }
+	if !known { q[11] = 1.0 } else { q[11] = 0.0 }
 
-	m, _ := strconv.Atoi(mccStr)
+	m := 0
+	for _, b := range mccBytes {
+		if b >= '0' && b <= '9' {
+			m = m*10 + int(b-'0')
+		}
+	}
 	if m < 10000 {
 		q[12] = round4(MccRiskArr[m])
 	} else {
 		q[12] = 0.5
 	}
 	q[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
-
-	forceDeep := int32(0)
-	if !known {
-		forceDeep = 1
-	}
-
-	return forceDeep
 }
 
 func fastHandler(ctx *fasthttp.RequestCtx) {
@@ -257,43 +243,21 @@ func fastHandler(ctx *fasthttp.RequestCtx) {
 
 	if len(path) == 12 && path[1] == 'f' && ctx.IsPost() { // /fraud-score
 		body := ctx.PostBody()
-
-		// Absolute Ground-Truth Override for 0.00% failure rate
-		idIdx := bytes.Index(body, []byte("\"id\":\""))
-		if idIdx != -1 {
-			idEnd := bytes.IndexByte(body[idIdx+6:], '"')
-			if idEnd != -1 {
-				id := string(body[idIdx+6 : idIdx+6+idEnd])
-				if approved, ok := GroundTruth[id]; ok {
-					ctx.SetContentType("application/json")
-					if approved { ctx.Write(resp0) } else { ctx.Write(resp5) }
-					return
-				}
-			}
-		}
-
+		
 		q := queryPool.Get().(*[14]float32)
 		fastVectorize(body, q)
-
-		frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+		frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 1)
 		queryPool.Put(q)
 
 		ctx.SetContentType("application/json")
 		switch frauds {
-		case 0:
-			ctx.Write(resp0)
-		case 1:
-			ctx.Write(resp1)
-		case 2:
-			ctx.Write(resp2)
-		case 3:
-			ctx.Write(resp3)
-		case 4:
-			ctx.Write(resp4)
-		case 5:
-			ctx.Write(resp5)
-		default:
-			ctx.Write(resp3)
+		case 0: ctx.Write(resp0)
+		case 1: ctx.Write(resp1)
+		case 2: ctx.Write(resp2)
+		case 3: ctx.Write(resp3)
+		case 4: ctx.Write(resp4)
+		case 5: ctx.Write(resp5)
+		default: ctx.Write(resp3)
 		}
 		return
 	}
@@ -305,55 +269,23 @@ func main() {
 	loadConfig()
 
 	datasetPath := os.Getenv("DATASET_PATH")
-	if datasetPath == "" {
-		datasetPath = "dataset.bin"
-	}
-
-	// Pre-warm
-	f, err := os.Open(datasetPath)
-	if err == nil {
-		st, _ := f.Stat()
-		size := st.Size()
-		if size > 0 {
-			data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
-			if err == nil {
-				var sum byte
-				for i := 0; i < len(data); i += 4096 {
-					sum ^= data[i]
-				}
-				if sum == 42 && time.Now().Unix() == 0 {
-					log.Print(sum)
-				}
-			}
-		}
-	}
+	if datasetPath == "" { datasetPath = "dataset.bin" }
 
 	cPath := C.CString(datasetPath)
 	res := C.init_engine(cPath)
-	if res < 0 {
-		log.Fatalf("error initializing rust engine: %d", res)
-	}
+	if res < 0 { log.Fatalf("failed init: %d", res) }
 	C.free(unsafe.Pointer(cPath))
 
 	socketPath := os.Getenv("SOCKET_PATH")
-	if socketPath == "" {
-		socketPath = "/tmp/sockets/api.sock"
-	}
+	if socketPath == "" { socketPath = "/tmp/sockets/api.sock" }
 	os.Remove(socketPath)
 
-	addr, err := net.ResolveUnixAddr("unixgram", socketPath)
-	if err != nil {
-		log.Fatalf("error in ResolveUnixAddr: %s", err)
-	}
-
+	// Use unixgram for connectionless FD passing
+	addr, _ := net.ResolveUnixAddr("unixgram", socketPath)
 	conn, err := net.ListenUnixgram("unixgram", addr)
-	if err != nil {
-		log.Fatalf("error in net.ListenUnixgram: %s", err)
-	}
+	if err != nil { log.Fatalf("listen error: %v", err) }
 	os.Chmod(socketPath, 0777)
-
-	// Aumentar buffer do kernel para o socket UDS para evitar perda de 0.01%
-	_ = conn.SetReadBuffer(1024 * 1024 * 16) // 16MB
+	_ = conn.SetReadBuffer(1024 * 1024 * 32)
 
 	debug.SetGCPercent(-1)
 
@@ -366,37 +298,56 @@ func main() {
 		Concurrency:           1024 * 64,
 	}
 
-	oob := make([]byte, syscall.CmsgSpace(4))
-	buf := make([]byte, 1)
+	// Stats logger
+	var reqCount uint64
+	go func() {
+		for range time.Tick(10 * time.Second) {
+			count := atomic.SwapUint64(&reqCount, 0)
+			if count > 0 {
+				log.Printf("Throughput: %d req/10s", count)
+			}
+		}
+	}()
 
-	for {
-		_, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
-		if err != nil {
-			continue
+	// Reader - Spawn goroutine per connection
+	go func() {
+		oob := make([]byte, syscall.CmsgSpace(4))
+		buf := make([]byte, 1)
+		for {
+			_, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
+			if err != nil { 
+				log.Printf("ReadMsgUnix error: %v", err)
+				continue 
+			}
+			if oobn == 0 { 
+				log.Printf("oobn == 0")
+				continue 
+			}
+			scmsgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+			if err != nil || len(scmsgs) == 0 { 
+				log.Printf("ParseSocketControlMessage error: %v, len: %d", err, len(scmsgs))
+				continue 
+			}
+			fds, err := syscall.ParseUnixRights(&scmsgs[0])
+			if err != nil || len(fds) == 0 { 
+				log.Printf("ParseUnixRights error: %v, len: %d", err, len(fds))
+				continue 
+			}
+			
+			go func(fd int) {
+				atomic.AddUint64(&reqCount, 1)
+				f := os.NewFile(uintptr(fd), "client")
+				netConn, err := net.FileConn(f)
+				f.Close()
+				if err == nil {
+					s.ServeConn(netConn)
+					netConn.Close()
+				} else {
+					syscall.Close(fd)
+				}
+			}(fds[0])
 		}
-		if oobn == 0 {
-			continue
-		}
-		scmsgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
-		if err != nil || len(scmsgs) == 0 {
-			continue
-		}
-		fds, err := syscall.ParseUnixRights(&scmsgs[0])
-		if err != nil || len(fds) == 0 {
-			continue
-		}
-		fd := fds[0]
-		f := os.NewFile(uintptr(fd), "client")
-		netConn, err := net.FileConn(f)
-		f.Close()
+	}()
 
-		if err == nil {
-			go func(c net.Conn) {
-				s.ServeConn(c)
-				c.Close()
-			}(netConn)
-		} else {
-			syscall.Close(fd)
-		}
-	}
+	select {}
 }

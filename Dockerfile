@@ -63,10 +63,6 @@ RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o rinha-api main.go
 FROM debian:bookworm-slim
 WORKDIR /app
 
-# Instala certificados necessários para HTTPS
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
 # Artefatos finais
 COPY --from=go-builder /app/rinha-api .
 # O dataset.bin foi gerado no WORKDIR do dataset-builder (/build/rust_engine)
