@@ -23,7 +23,7 @@ services:
       dockerfile: Dockerfile.lb
     environment:
       - PORT=9999
-      - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock,/tmp/sockets/api3.sock
+      - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock
     volumes:
       - shared_sockets:/tmp/sockets
     ports:
@@ -31,7 +31,6 @@ services:
     depends_on:
       - api1
       - api2
-      - api3
     networks:
       - rinha-net
     security_opt:
@@ -46,26 +45,22 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.15'
-          memory: '100M'
+          cpus: '0.10'
+          memory: '50M'
 
   api1:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
-      - GOMEMLIMIT=100MiB
+      - GOMEMLIMIT=130MiB
+      - GOGC=1000
 
   api2:
     <<: *api-common
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
-      - GOMEMLIMIT=100MiB
-
-  api3:
-    <<: *api-common
-    environment:
-      - SOCKET_PATH=/tmp/sockets/api3.sock
-      - GOMEMLIMIT=100MiB
+      - GOMEMLIMIT=130MiB
+      - GOGC=1000
 
   warmup:
     image: curlimages/curl:8.8.0

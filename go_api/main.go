@@ -15,19 +15,17 @@ import (
 	"encoding/json"
 	"log"
 	"math"
-	"net"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/buger/jsonparser"
-	"github.com/valyala/fasthttp"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -43,12 +41,15 @@ var (
 var MccRiskArr [10000]float32
 
 var (
-	resp0 = []byte(`{"approved":true,"fraud_score":0.0}`)
-	resp1 = []byte(`{"approved":true,"fraud_score":0.2}`)
-	resp2 = []byte(`{"approved":true,"fraud_score":0.4}`)
-	resp3 = []byte(`{"approved":false,"fraud_score":0.6}`)
-	resp4 = []byte(`{"approved":false,"fraud_score":0.8}`)
-	resp5 = []byte(`{"approved":false,"fraud_score":1.0}`)
+	resp0 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
+	resp1 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
+	resp2 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
+	resp3 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
+	resp4 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
+	resp5 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
+
+	respReady = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 )
 
 var queryPool = sync.Pool{
@@ -59,7 +60,9 @@ var queryPool = sync.Pool{
 
 func loadConfig() {
 	normData, err := os.ReadFile("resources/normalization.json")
-	if err != nil { log.Fatalf("err: %v", err) }
+	if err != nil {
+		log.Fatalf("err: %v", err)
+	}
 	var norm struct {
 		MaxAmount            float64 `json:"max_amount"`
 		MaxInstallments      float64 `json:"max_installments"`
@@ -95,13 +98,19 @@ func loadConfig() {
 }
 
 func clamp(v float64) float32 {
-	if v < 0 { return 0 }
-	if v > 1 { return 1 }
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
 	return float32(v)
 }
 
 func round4(v float32) float32 {
-	if v == -1 { return -1 }
+	if v == -1 {
+		return -1
+	}
 	return float32(math.Round(float64(v)*10000) / 10000)
 }
 
@@ -153,25 +162,39 @@ func fastVectorize(body []byte, q *[14]float32) {
 
 	jsonparser.EachKey(body, func(idx int, value []byte, dataType jsonparser.ValueType, err error) {
 		switch idx {
-		case 0: amt, _ = jsonparser.ParseFloat(value)
-		case 1: inst, _ = jsonparser.ParseInt(value)
-		case 2: reqAtBytes = value
-		case 3: cAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 4: txCount, _ = jsonparser.ParseInt(value)
-		case 5: merchantsBytes = value
+		case 0:
+			amt, _ = jsonparser.ParseFloat(value)
+		case 1:
+			inst, _ = jsonparser.ParseInt(value)
+		case 2:
+			reqAtBytes = value
+		case 3:
+			cAvgAmt, _ = jsonparser.ParseFloat(value)
+		case 4:
+			txCount, _ = jsonparser.ParseInt(value)
+		case 5:
+			merchantsBytes = value
 		case 6:
 			if len(value) >= 2 && value[0] == '"' {
 				merchantId = value[1 : len(value)-1]
 			} else {
 				merchantId = value
 			}
-		case 7: mccBytes = value
-		case 8: mAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 9: isOnline, _ = jsonparser.ParseBoolean(value)
-		case 10: cardPresent, _ = jsonparser.ParseBoolean(value)
-		case 11: kmHome, _ = jsonparser.ParseFloat(value)
-		case 12: lastTsBytes = value; hasLastTx = true
-		case 13: kmLast, _ = jsonparser.ParseFloat(value)
+		case 7:
+			mccBytes = value
+		case 8:
+			mAvgAmt, _ = jsonparser.ParseFloat(value)
+		case 9:
+			isOnline, _ = jsonparser.ParseBoolean(value)
+		case 10:
+			cardPresent, _ = jsonparser.ParseBoolean(value)
+		case 11:
+			kmHome, _ = jsonparser.ParseFloat(value)
+		case 12:
+			lastTsBytes = value
+			hasLastTx = true
+		case 13:
+			kmLast, _ = jsonparser.ParseFloat(value)
 		}
 	}, jsonPaths...)
 
@@ -216,9 +239,21 @@ func fastVectorize(body []byte, q *[14]float32) {
 
 	q[7] = round4(clamp(kmHome / MaxKm))
 	q[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
-	if isOnline { q[9] = 1.0 } else { q[9] = 0.0 }
-	if cardPresent { q[10] = 1.0 } else { q[10] = 0.0 }
-	if !known { q[11] = 1.0 } else { q[11] = 0.0 }
+	if isOnline {
+		q[9] = 1.0
+	} else {
+		q[9] = 0.0
+	}
+	if cardPresent {
+		q[10] = 1.0
+	} else {
+		q[10] = 0.0
+	}
+	if !known {
+		q[11] = 1.0
+	} else {
+		q[11] = 0.0
+	}
 
 	m := 0
 	for _, b := range mccBytes {
@@ -234,72 +269,60 @@ func fastVectorize(body []byte, q *[14]float32) {
 	q[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
 }
 
-func fastHandler(ctx *fasthttp.RequestCtx) {
-	path := ctx.Path()
-	if len(path) == 6 && path[1] == 'r' { // /ready
-		ctx.SetStatusCode(200)
-		return
-	}
-
-	if len(path) == 12 && path[1] == 'f' && ctx.IsPost() { // /fraud-score
-		body := ctx.PostBody()
-		
-		q := queryPool.Get().(*[14]float32)
-		fastVectorize(body, q)
-		frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 1)
-		queryPool.Put(q)
-
-		ctx.SetContentType("application/json")
-		switch frauds {
-		case 0: ctx.Write(resp0)
-		case 1: ctx.Write(resp1)
-		case 2: ctx.Write(resp2)
-		case 3: ctx.Write(resp3)
-		case 4: ctx.Write(resp4)
-		case 5: ctx.Write(resp5)
-		default: ctx.Write(resp3)
-		}
-		return
-	}
-	ctx.SetStatusCode(404)
-}
+var reqCount uint64
 
 func main() {
 	runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
 	loadConfig()
 
 	datasetPath := os.Getenv("DATASET_PATH")
-	if datasetPath == "" { datasetPath = "dataset.bin" }
+	if datasetPath == "" {
+		datasetPath = "dataset.bin"
+	}
 
 	cPath := C.CString(datasetPath)
 	res := C.init_engine(cPath)
-	if res < 0 { log.Fatalf("failed init: %d", res) }
+	if res < 0 {
+		log.Fatalf("failed init: %d", res)
+	}
 	C.free(unsafe.Pointer(cPath))
 
 	socketPath := os.Getenv("SOCKET_PATH")
-	if socketPath == "" { socketPath = "/tmp/sockets/api.sock" }
+	if socketPath == "" {
+		socketPath = "/tmp/sockets/api.sock"
+	}
 	os.Remove(socketPath)
 
-	// Use unixgram for connectionless FD passing
-	addr, _ := net.ResolveUnixAddr("unixgram", socketPath)
-	conn, err := net.ListenUnixgram("unixgram", addr)
-	if err != nil { log.Fatalf("listen error: %v", err) }
-	os.Chmod(socketPath, 0777)
-	_ = conn.SetReadBuffer(1024 * 1024 * 32)
+	uds_fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		log.Fatalf("socket error: %v", err)
+	}
+	if err := unix.Bind(uds_fd, &unix.SockaddrUnix{Name: socketPath}); err != nil {
+		log.Fatalf("bind error: %v", err)
+	}
+	if err := os.Chmod(socketPath, 0777); err != nil {
+		log.Fatalf("chmod error: %v", err)
+	}
+	if err := unix.SetNonblock(uds_fd, true); err != nil {
+		log.Fatalf("setnonblock error: %v", err)
+	}
 
 	debug.SetGCPercent(-1)
 
-	s := &fasthttp.Server{
-		Handler:               fastHandler,
-		NoDefaultServerHeader: true,
-		NoDefaultDate:         true,
-		NoDefaultContentType:  true,
-		Name:                  "rinha",
-		Concurrency:           1024 * 64,
+	epfd, err := unix.EpollCreate1(0)
+	if err != nil {
+		log.Fatalf("epoll_create1 error: %v", err)
 	}
 
-	// Stats logger
-	var reqCount uint64
+	event := &unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		Fd:     int32(uds_fd),
+	}
+	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, uds_fd, event); err != nil {
+		log.Fatalf("epoll_ctl error: %v", err)
+	}
+
 	go func() {
 		for range time.Tick(10 * time.Second) {
 			count := atomic.SwapUint64(&reqCount, 0)
@@ -309,45 +332,92 @@ func main() {
 		}
 	}()
 
-	// Reader - Spawn goroutine per connection
-	go func() {
-		oob := make([]byte, syscall.CmsgSpace(4))
-		buf := make([]byte, 1)
-		for {
-			_, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
-			if err != nil { 
-				log.Printf("ReadMsgUnix error: %v", err)
-				continue 
-			}
-			if oobn == 0 { 
-				log.Printf("oobn == 0")
-				continue 
-			}
-			scmsgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
-			if err != nil || len(scmsgs) == 0 { 
-				log.Printf("ParseSocketControlMessage error: %v, len: %d", err, len(scmsgs))
-				continue 
-			}
-			fds, err := syscall.ParseUnixRights(&scmsgs[0])
-			if err != nil || len(fds) == 0 { 
-				log.Printf("ParseUnixRights error: %v, len: %d", err, len(fds))
-				continue 
-			}
-			
-			go func(fd int) {
-				atomic.AddUint64(&reqCount, 1)
-				f := os.NewFile(uintptr(fd), "client")
-				netConn, err := net.FileConn(f)
-				f.Close()
-				if err == nil {
-					s.ServeConn(netConn)
-					netConn.Close()
-				} else {
-					syscall.Close(fd)
-				}
-			}(fds[0])
-		}
-	}()
+	events := make([]unix.EpollEvent, 4096)
+	buf := make([]byte, 8192)
+	oob := make([]byte, unix.CmsgSpace(4))
+	dummy := make([]byte, 1)
 
-	select {}
+	for {
+		n, err := unix.EpollWait(epfd, events, -1)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			log.Fatalf("epoll_wait error: %v", err)
+		}
+
+		for i := 0; i < n; i++ {
+			fd := int(events[i].Fd)
+
+			if fd == uds_fd {
+				// FD Passing
+				_, oobn, _, _, err := unix.Recvmsg(uds_fd, dummy, oob, 0)
+				if err != nil {
+					continue
+				}
+				msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+				if err != nil || len(msgs) == 0 {
+					continue
+				}
+				fds, err := unix.ParseUnixRights(&msgs[0])
+				if err != nil || len(fds) == 0 {
+					continue
+				}
+
+				client_fd := fds[0]
+				unix.SetNonblock(client_fd, true)
+				unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+				continue
+			}
+
+			// Client socket
+			rn, err := unix.Read(fd, buf)
+			if err != nil {
+				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+					continue
+				}
+				unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+				unix.Close(fd)
+				continue
+			}
+			if rn <= 0 {
+				unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+				unix.Close(fd)
+				continue
+			}
+
+			atomic.AddUint64(&reqCount, 1)
+			data := buf[:rn]
+
+			if bytes.HasPrefix(data, []byte("GET /ready")) {
+				unix.Write(fd, respReady)
+			} else if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
+				bodyIdx := bytes.Index(data, []byte("\r\n\r\n"))
+				if bodyIdx != -1 {
+					body := data[bodyIdx+4:]
+					q := queryPool.Get().(*[14]float32)
+					fastVectorize(body, q)
+					frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+					queryPool.Put(q)
+
+					switch frauds {
+					case 0: unix.Write(fd, resp0)
+					case 1: unix.Write(fd, resp1)
+					case 2: unix.Write(fd, resp2)
+					case 3: unix.Write(fd, resp3)
+					case 4: unix.Write(fd, resp4)
+					case 5: unix.Write(fd, resp5)
+					default: unix.Write(fd, resp3)
+					}
+				} else {
+					unix.Write(fd, resp404)
+				}
+			} else {
+				unix.Write(fd, resp404)
+			}
+
+			unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+			unix.Close(fd)
+		}
+	}
 }

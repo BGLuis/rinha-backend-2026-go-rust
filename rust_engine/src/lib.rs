@@ -26,28 +26,27 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         let path = match c_str.to_str() { Ok(s) => s, Err(_) => return -1 };
         let file = match File::open(path) { Ok(f) => f, Err(_) => return -2 };
         let mmap = match MmapOptions::new().map(&file) { Ok(m) => m, Err(_) => return -3 };
-        
-        // Pin to RAM to avoid page faults
+
         libc::mlock(mmap.as_ptr() as *const libc::c_void, mmap.len());
-        
+
         let header = slice::from_raw_parts(mmap.as_ptr() as *const u32, 16);
         if header[0] != 0x4E495452 { return -4; }
-        
+
         let k = header[2] as usize;
         NUM_CLUSTERS = k;
-        
+
         let centroids_ptr = mmap.as_ptr().add(64) as *const [f32; 16];
         CENTROIDS = Some(slice::from_raw_parts(centroids_ptr, k));
 
         let bboxes_ptr = mmap.as_ptr().add(64 + k * 64) as *const [i16; 32];
         BBOXES = Some(slice::from_raw_parts(bboxes_ptr, k));
-        
+
         let offsets_ptr = mmap.as_ptr().add(64 + k * 64 + k * 64) as *const u32;
         OFFSETS = Some(slice::from_raw_parts(offsets_ptr, k));
-        
+
         let sizes_ptr = mmap.as_ptr().add(64 + k * 64 + k * 64 + k * 4) as *const u32;
         SIZES = Some(slice::from_raw_parts(sizes_ptr, k));
-        
+
         DATASET_MMAP = Some(mmap);
         0
     }
@@ -74,16 +73,13 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
 
     let mut centroid_dists = [(0.0f32, 0usize); 4096];
     let n_centroids = std::cmp::min(num_k, 4096);
-    
-    // SIMD-accelerated centroid distance calculation
+
     let q_simd: [__m256; 2] = [
         _mm256_loadu_ps(q.as_ptr()),
         _mm256_loadu_ps(q.as_ptr().add(8))
     ];
 
     for ki in (0..n_centroids).step_by(1) {
-        // Fallback to SIMD-optimized arch function for now, 
-        // as implementing full 8-way SIMD for centroids is complex for single turn
         let d2 = dist_sq_f32_arch(q.as_ptr(), centroids[ki].as_ptr());
         centroid_dists[ki] = (d2, ki);
     }
@@ -91,8 +87,7 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     let sub = &mut centroid_dists[0..n_centroids];
     sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // nprobe=192 is the sweet spot for 100% recall and sub-2ms latency
-    let nprobe = if force_deep == 1 { 192 } else { 16 };
+    let nprobe = if force_deep == 1 { 192 } else { 8 };
 
     for i in 0..nprobe {
         if i >= sub.len() { break; }
@@ -129,7 +124,7 @@ unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offset
     if n == 0 { return; }
     let num_blocks = (n + 7) / 8;
     let base_ptr = mmap_ptr.add(offsets[ki] as usize);
-    
+
     let q_simd: [__m256; 14] = [
         _mm256_set1_ps(q[0]), _mm256_set1_ps(q[1]), _mm256_set1_ps(q[2]), _mm256_set1_ps(q[3]),
         _mm256_set1_ps(q[4]), _mm256_set1_ps(q[5]), _mm256_set1_ps(q[6]), _mm256_set1_ps(q[7]),
