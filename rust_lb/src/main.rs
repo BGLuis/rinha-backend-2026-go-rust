@@ -2,19 +2,20 @@ use std::ffi::CString;
 use std::mem;
 use std::os::unix::io::RawFd;
 use std::ptr;
-use io_uring::{IoUring, opcode, types};
 
 const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_BACKLOG: i32 = 8192;
-const DEFAULT_RING_QD: u32 = 4096;
 
 fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT);
     let upstreams_env = std::env::var("UPSTREAMS").unwrap_or_else(|_| "".to_string());
     let upstreams: Vec<String> = upstreams_env.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-    
+
     let listen_fd = create_listener(port, DEFAULT_BACKLOG)?;
-    
+    unsafe {
+        libc::fcntl(listen_fd, libc::F_SETFL, libc::O_NONBLOCK);
+    }
+
     // UDS socket MUST be BLOCKING to provide backpressure and avoid dropping FDs
     let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
     if uds_fd < 0 { return Err(std::io::Error::last_os_error()); }
@@ -23,7 +24,7 @@ fn main() -> std::io::Result<()> {
     unsafe {
         libc::setsockopt(uds_fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &sndbuf as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
     }
-    
+
     let mut up_addrs = Vec::with_capacity(upstreams.len());
     for ups in upstreams {
         let c_path = CString::new(ups).unwrap();
@@ -36,36 +37,56 @@ fn main() -> std::io::Result<()> {
         up_addrs.push(addr);
     }
 
-    let mut ring = IoUring::builder().build(DEFAULT_RING_QD)?;
-    push_accept(&mut ring, listen_fd);
+    let epfd = unsafe { libc::epoll_create1(0) };
+    if epfd < 0 { return Err(std::io::Error::last_os_error()); }
 
-    let mut cqes = Vec::with_capacity(DEFAULT_RING_QD as usize);
+    let mut event = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: listen_fd as u64,
+    };
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, listen_fd, &mut event) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 4096];
     let mut rr = 0;
 
     loop {
-        ring.submit_and_wait(1)?;
-        cqes.clear();
-        cqes.extend(ring.completion());
-        for cqe in cqes.drain(..) {
-            let res = cqe.result();
-            if (cqe.flags() & 1 << 0) == 0 { // CQE_F_MORE
-                push_accept(&mut ring, listen_fd);
-            }
-            if res < 0 { continue; }
-            
-            let client_fd = res as RawFd;
-            unsafe {
-                let one: libc::c_int = 1;
-                libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
-            }
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), events.capacity() as i32, -1) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == libc::EINTR { continue; }
+            break;
+        }
 
-            let target_addr = &up_addrs[rr % up_addrs.len()];
-            rr = rr.wrapping_add(1);
+        for i in 0..n as usize {
+            if events[i].u64 == listen_fd as u64 {
+                loop {
+                    let client_fd = unsafe { libc::accept4(listen_fd, ptr::null_mut(), ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
+                    if client_fd < 0 {
+                        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                            break;
+                        }
+                        continue;
+                    }
 
-            send_fd(uds_fd, target_addr, client_fd);
-            unsafe { libc::close(client_fd); }
+                    unsafe {
+                        let one: libc::c_int = 1;
+                        libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    }
+
+                    let target_addr = &up_addrs[rr % up_addrs.len()];
+                    rr = rr.wrapping_add(1);
+
+                    send_fd(uds_fd, target_addr, client_fd);
+                    unsafe { libc::close(client_fd); }
+                }
+            }
         }
     }
+    
+    Ok(())
 }
 
 fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int) {
@@ -78,7 +99,7 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
 
-        let mut cmsg_buf = [0u8; 24]; 
+        let mut cmsg_buf = [0u8; 24];
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = 24;
 
@@ -92,14 +113,8 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
             msg.msg_controllen = (*cmsg).cmsg_len;
         }
 
-        // Blocking send with SEQPACKET provides backpressure
         libc::sendmsg(sock, &msg, 0);
     }
-}
-
-fn push_accept(ring: &mut IoUring, listen_fd: RawFd) {
-    let sqe = opcode::AcceptMulti::new(types::Fd(listen_fd)).build().user_data(1);
-    unsafe { let _ = ring.submission().push(&sqe); }
 }
 
 fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
