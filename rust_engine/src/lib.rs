@@ -87,7 +87,7 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     let sub = &mut centroid_dists[0..n_centroids];
     sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let nprobe = if force_deep == 1 { 192 } else { 8 };
+    let nprobe = if force_deep == 1 { 192 } else { 64 };
 
     for i in 0..nprobe {
         if i >= sub.len() { break; }
@@ -125,13 +125,13 @@ unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offset
     let num_blocks = (n + 7) / 8;
     let base_ptr = mmap_ptr.add(offsets[ki] as usize);
 
+    let scale_inv = 10000.0f32;
     let q_simd: [__m256; 14] = [
-        _mm256_set1_ps(q[0]), _mm256_set1_ps(q[1]), _mm256_set1_ps(q[2]), _mm256_set1_ps(q[3]),
-        _mm256_set1_ps(q[4]), _mm256_set1_ps(q[5]), _mm256_set1_ps(q[6]), _mm256_set1_ps(q[7]),
-        _mm256_set1_ps(q[8]), _mm256_set1_ps(q[9]), _mm256_set1_ps(q[10]), _mm256_set1_ps(q[11]),
-        _mm256_set1_ps(q[12]), _mm256_set1_ps(q[13])
+        _mm256_set1_ps(q[0] * scale_inv), _mm256_set1_ps(q[1] * scale_inv), _mm256_set1_ps(q[2] * scale_inv), _mm256_set1_ps(q[3] * scale_inv),
+        _mm256_set1_ps(q[4] * scale_inv), _mm256_set1_ps(q[5] * scale_inv), _mm256_set1_ps(q[6] * scale_inv), _mm256_set1_ps(q[7] * scale_inv),
+        _mm256_set1_ps(q[8] * scale_inv), _mm256_set1_ps(q[9] * scale_inv), _mm256_set1_ps(q[10] * scale_inv), _mm256_set1_ps(q[11] * scale_inv),
+        _mm256_set1_ps(q[12] * scale_inv), _mm256_set1_ps(q[13] * scale_inv)
     ];
-    let scale = _mm256_set1_ps(0.0001);
 
     for bi in 0..num_blocks {
         let block_ptr = base_ptr.add(bi * 256);
@@ -141,24 +141,25 @@ unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offset
         let mut acc = _mm256_setzero_ps();
         for d in 0..8 {
             let v_i16 = _mm_loadu_si128(block_ptr.add(d * 16) as *const __m128i);
-            let v_f32 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16)), scale);
+            let v_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16));
             let diff = _mm256_sub_ps(v_f32, q_simd[d]);
             acc = _mm256_fmadd_ps(diff, diff, acc);
         }
 
-        let threshold = _mm256_set1_ps(top_dists[4]);
+        let threshold = _mm256_set1_ps(top_dists[4] * 100_000_000.0);
         if _mm256_movemask_ps(_mm256_cmp_ps(acc, threshold, _CMP_GT_OQ)) == 0xFF {
             continue;
         }
 
         for d in 8..14 {
             let v_i16 = _mm_loadu_si128(block_ptr.add(d * 16) as *const __m128i);
-            let v_f32 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16)), scale);
+            let v_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16));
             let diff = _mm256_sub_ps(v_f32, q_simd[d]);
             acc = _mm256_fmadd_ps(diff, diff, acc);
         }
 
-        let dists: [f32; 8] = std::mem::transmute(acc);
+        let acc_scaled = _mm256_mul_ps(acc, _mm256_set1_ps(0.00000001));
+        let dists: [f32; 8] = std::mem::transmute(acc_scaled);
         let metas = slice::from_raw_parts(block_ptr.add(224) as *const u32, 8);
 
         for i in 0..8 {
