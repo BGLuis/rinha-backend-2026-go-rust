@@ -87,12 +87,17 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     let sub = &mut centroid_dists[0..n_centroids];
     sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let nprobe = if force_deep == 1 { 192 } else { 64 };
+    let nprobe = if force_deep == 1 { 192 } else { 32 };
+
+    let mut q_i16 = [0i16; 16];
+    for d in 0..14 {
+        q_i16[d] = (q[d] * 10000.0) as i16;
+    }
 
     for i in 0..nprobe {
         if i >= sub.len() { break; }
         let ki = sub[i].1;
-        if min_dist_to_bbox(&q, &bboxes[ki]) > top_dists[4] { continue; }
+        if (min_dist_to_bbox_i32(&q_i16, &bboxes[ki]) as f32) * 0.00000001 > top_dists[4] { continue; }
         scan_cluster_soa(ki, &q, mmap_ptr, offsets, sizes, &mut top_dists, &mut top_indices, &mut top_labels);
     }
 
@@ -100,13 +105,12 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
 }
 
 #[inline(always)]
-unsafe fn min_dist_to_bbox(q: &[f32; 16], bbox: &[i16; 32]) -> f32 {
-    let mut dist2 = 0.0f32;
-    const SCALE: f32 = 0.0001;
+unsafe fn min_dist_to_bbox_i32(q_i16: &[i16; 16], bbox: &[i16; 32]) -> i32 {
+    let mut dist2 = 0i32;
     for d in 0..14 {
-        let b_min = bbox[d] as f32 * SCALE;
-        let b_max = bbox[d+16] as f32 * SCALE;
-        let qd = q[d];
+        let b_min = bbox[d] as i32;
+        let b_max = bbox[d+16] as i32;
+        let qd = q_i16[d] as i32;
         if qd < b_min {
             let diff = b_min - qd;
             dist2 += diff * diff;

@@ -508,16 +508,7 @@ func main() {
 					body := data[bodyIdx+4:]
 					q := queryPool.Get().(*[14]float32)
 					
-					// Previne panics por parsing incorreto estragarem o worker
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								// Em caso de falha silenciosa, a base q[i] permanece 0, ou podemos setar valores dummy
-								log.Printf("Panic in parse: %v", r)
-							}
-						}()
-						fastVectorize(body, q)
-					}()
+					fastVectorize(body, q)
 
 					frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
 					queryPool.Put(q)
