@@ -24,7 +24,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/buger/jsonparser"
 	"golang.org/x/sys/unix"
 )
 
@@ -114,10 +113,162 @@ func round4(v float32) float32 {
 	return float32(math.Round(float64(v)*10000) / 10000)
 }
 
-func fastParseTime(s []byte) time.Time {
-	if len(s) >= 2 && s[0] == '"' {
-		s = s[1 : len(s)-1]
+var (
+	keyTx           = []byte(`"transaction"`)
+	keyCust         = []byte(`"customer"`)
+	keyMerch        = []byte(`"merchant"`)
+	keyTerm         = []byte(`"terminal"`)
+	keyLastTx       = []byte(`"last_transaction"`)
+
+	keyAmount       = []byte(`"amount"`)
+	keyInst         = []byte(`"installments"`)
+	keyReqAt        = []byte(`"requested_at"`)
+	keyAvgAmount    = []byte(`"avg_amount"`)
+	keyTxCount      = []byte(`"tx_count_24h"`)
+	keyKnownMerch   = []byte(`"known_merchants"`)
+	keyId           = []byte(`"id"`)
+	keyMcc          = []byte(`"mcc"`)
+	keyIsOnline     = []byte(`"is_online"`)
+	keyCardPres     = []byte(`"card_present"`)
+	keyKmHome       = []byte(`"km_from_home"`)
+	keyTimestamp    = []byte(`"timestamp"`)
+	keyKmCurr       = []byte(`"km_from_current"`)
+)
+
+func parseFloatFast(b []byte, start int) (float64, int) {
+	var val float64
+	var dec float64
+	inDec := false
+	div := 1.0
+	i := start
+	for ; i < len(b); i++ {
+		ch := b[i]
+		if ch >= '0' && ch <= '9' {
+			if inDec {
+				dec = dec*10 + float64(ch-'0')
+				div *= 10
+			} else {
+				val = val*10 + float64(ch-'0')
+			}
+		} else if ch == '.' {
+			inDec = true
+		} else {
+			break
+		}
 	}
+	return val + dec/div, i
+}
+
+func parseIntFast(b []byte, start int) (int64, int) {
+	var val int64
+	i := start
+	for ; i < len(b); i++ {
+		ch := b[i]
+		if ch >= '0' && ch <= '9' {
+			val = val*10 + int64(ch-'0')
+		} else {
+			break
+		}
+	}
+	return val, i
+}
+
+func parseBoolFast(b []byte, start int) (bool, int) {
+	if start < len(b) && b[start] == 't' {
+		return true, start+4
+	}
+	return false, start+5
+}
+
+func parseStringFast(b []byte, start int) ([]byte, int) {
+	if start >= len(b) || b[start] != '"' {
+		return nil, start
+	}
+	start++
+	for i := start; i < len(b); i++ {
+		if b[i] == '"' {
+			return b[start:i], i + 1
+		}
+	}
+	return nil, len(b)
+}
+
+func findValStart(b []byte, key []byte) int {
+	idx := bytes.Index(b, key)
+	if idx == -1 {
+		return -1
+	}
+	start := idx + len(key)
+	for start < len(b) && (b[start] == ' ' || b[start] == ':' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	return start
+}
+
+func getBlock(b []byte, key []byte) []byte {
+	idx := bytes.Index(b, key)
+	if idx == -1 {
+		return nil
+	}
+	start := idx + len(key)
+	for start < len(b) && b[start] != '{' && b[start] != 'n' {
+		start++
+	}
+	if start < len(b) && b[start] == 'n' {
+		return nil
+	}
+	depth := 0
+	for i := start; i < len(b); i++ {
+		if b[i] == '{' {
+			depth++
+		}
+		if b[i] == '}' {
+			depth--
+			if depth == 0 {
+				return b[start : i+1]
+			}
+		}
+	}
+	return b[start:]
+}
+
+func getValFloat(b []byte, key []byte) float64 {
+	start := findValStart(b, key)
+	if start == -1 {
+		return 0
+	}
+	f, _ := parseFloatFast(b, start)
+	return f
+}
+
+func getValInt(b []byte, key []byte) int64 {
+	start := findValStart(b, key)
+	if start == -1 {
+		return 0
+	}
+	v, _ := parseIntFast(b, start)
+	return v
+}
+
+func getValBool(b []byte, key []byte) bool {
+	start := findValStart(b, key)
+	if start == -1 {
+		return false
+	}
+	v, _ := parseBoolFast(b, start)
+	return v
+}
+
+func getValString(b []byte, key []byte) []byte {
+	start := findValStart(b, key)
+	if start == -1 {
+		return nil
+	}
+	v, _ := parseStringFast(b, start)
+	return v
+}
+
+func fastParseTimeStr(s []byte) time.Time {
 	if len(s) < 19 {
 		return time.Time{}
 	}
@@ -130,90 +281,50 @@ func fastParseTime(s []byte) time.Time {
 	return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
 }
 
-var jsonPaths = [][]string{
-	{"transaction", "amount"},           // 0
-	{"transaction", "installments"},     // 1
-	{"transaction", "requested_at"},      // 2
-	{"customer", "avg_amount"},          // 3
-	{"customer", "tx_count_24h"},        // 4
-	{"customer", "known_merchants"},     // 5
-	{"merchant", "id"},                  // 6
-	{"merchant", "mcc"},                 // 7
-	{"merchant", "avg_amount"},          // 8
-	{"terminal", "is_online"},           // 9
-	{"terminal", "card_present"},        // 10
-	{"terminal", "km_from_home"},         // 11
-	{"last_transaction", "timestamp"},    // 12
-	{"last_transaction", "km_from_current"}, // 13
-}
-
-var nullBytes = []byte("null")
-
 func fastVectorize(body []byte, q *[14]float32) {
-	var (
-		amt, cAvgAmt, mAvgAmt, kmHome, kmLast float64
-		inst, txCount                         int64
-		reqAtBytes, mccBytes, merchantsBytes  []byte
-		merchantId                            []byte
-		lastTsBytes                           []byte
-		isOnline, cardPresent                 bool
-		hasLastTx                             bool
-	)
+	txBlock := getBlock(body, keyTx)
+	amt := getValFloat(txBlock, keyAmount)
+	inst := getValInt(txBlock, keyInst)
+	reqAtBytes := getValString(txBlock, keyReqAt)
 
-	jsonparser.EachKey(body, func(idx int, value []byte, dataType jsonparser.ValueType, err error) {
-		switch idx {
-		case 0:
-			amt, _ = jsonparser.ParseFloat(value)
-		case 1:
-			inst, _ = jsonparser.ParseInt(value)
-		case 2:
-			reqAtBytes = value
-		case 3:
-			cAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 4:
-			txCount, _ = jsonparser.ParseInt(value)
-		case 5:
-			merchantsBytes = value
-		case 6:
-			if len(value) >= 2 && value[0] == '"' {
-				merchantId = value[1 : len(value)-1]
-			} else {
-				merchantId = value
-			}
-		case 7:
-			mccBytes = value
-		case 8:
-			mAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 9:
-			isOnline, _ = jsonparser.ParseBoolean(value)
-		case 10:
-			cardPresent, _ = jsonparser.ParseBoolean(value)
-		case 11:
-			kmHome, _ = jsonparser.ParseFloat(value)
-		case 12:
-			lastTsBytes = value
-			hasLastTx = true
-		case 13:
-			kmLast, _ = jsonparser.ParseFloat(value)
+	custBlock := getBlock(body, keyCust)
+	cAvgAmt := getValFloat(custBlock, keyAvgAmount)
+	txCount := getValInt(custBlock, keyTxCount)
+	knownMerchStart := findValStart(custBlock, keyKnownMerch)
+	var knownMerchBlock []byte
+	if knownMerchStart != -1 && knownMerchStart < len(custBlock) && custBlock[knownMerchStart] == '[' {
+		end := bytes.IndexByte(custBlock[knownMerchStart:], ']')
+		if end != -1 {
+			knownMerchBlock = custBlock[knownMerchStart : knownMerchStart+end+1]
 		}
-	}, jsonPaths...)
-
-	known := false
-	if merchantsBytes != nil {
-		jsonparser.ArrayEach(merchantsBytes, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
-			if !known {
-				v := value
-				if len(v) >= 2 && v[0] == '"' {
-					v = v[1 : len(v)-1]
-				}
-				if bytes.Equal(v, merchantId) {
-					known = true
-				}
-			}
-		})
 	}
 
-	reqAt := fastParseTime(reqAtBytes)
+	merchBlock := getBlock(body, keyMerch)
+	merchId := getValString(merchBlock, keyId)
+	mccBytes := getValString(merchBlock, keyMcc)
+	mAvgAmt := getValFloat(merchBlock, keyAvgAmount)
+
+	termBlock := getBlock(body, keyTerm)
+	isOnline := getValBool(termBlock, keyIsOnline)
+	cardPresent := getValBool(termBlock, keyCardPres)
+	kmHome := getValFloat(termBlock, keyKmHome)
+
+	lastTxBlock := getBlock(body, keyLastTx)
+	var lastTsBytes []byte
+	var kmLast float64
+	hasLastTx := false
+	if len(lastTxBlock) > 0 {
+		hasLastTx = true
+		lastTsBytes = getValString(lastTxBlock, keyTimestamp)
+		kmLast = getValFloat(lastTxBlock, keyKmCurr)
+	}
+
+	known := false
+	if len(knownMerchBlock) > 0 && len(merchId) > 0 {
+		known = bytes.Contains(knownMerchBlock, merchId)
+	}
+
+	reqAt := fastParseTimeStr(reqAtBytes)
 	reqHour := reqAt.Hour()
 	reqWeekday := int(reqAt.Weekday()+6) % 7
 
@@ -227,11 +338,11 @@ func fastVectorize(body []byte, q *[14]float32) {
 	q[3] = round4(float32(reqHour) / 23.0)
 	q[4] = round4(float32(reqWeekday) / 6.0)
 
-	if !hasLastTx || lastTsBytes == nil || len(lastTsBytes) == 0 || bytes.Equal(lastTsBytes, nullBytes) {
+	if !hasLastTx || len(lastTsBytes) == 0 {
 		q[5] = -1.0
 		q[6] = -1.0
 	} else {
-		lastTs := fastParseTime(lastTsBytes)
+		lastTs := fastParseTimeStr(lastTsBytes)
 		minutes := float64(reqAt.Unix()-lastTs.Unix()) / 60.0
 		q[5] = round4(clamp(minutes / MaxMinutes))
 		q[6] = round4(clamp(kmLast / MaxKm))
@@ -396,18 +507,38 @@ func main() {
 				if bodyIdx != -1 {
 					body := data[bodyIdx+4:]
 					q := queryPool.Get().(*[14]float32)
-					fastVectorize(body, q)
+					
+					// Previne panics por parsing incorreto estragarem o worker
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Em caso de falha silenciosa, a base q[i] permanece 0, ou podemos setar valores dummy
+								log.Printf("Panic in parse: %v", r)
+							}
+						}()
+						fastVectorize(body, q)
+					}()
+
 					frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
 					queryPool.Put(q)
 
 					switch frauds {
-					case 0: unix.Write(fd, resp0)
-					case 1: unix.Write(fd, resp1)
-					case 2: unix.Write(fd, resp2)
-					case 3: unix.Write(fd, resp3)
-					case 4: unix.Write(fd, resp4)
-					case 5: unix.Write(fd, resp5)
-					default: unix.Write(fd, resp3)
+					case 0:
+						unix.Write(fd, resp0)
+					case 1:
+						unix.Write(fd, resp1)
+					case 2:
+						unix.Write(fd, resp2)
+					case 3:
+						unix.Write(fd, resp3)
+					case 4:
+						unix.Write(fd, resp4)
+					case 5:
+						unix.Write(fd, resp5)
+					default:
+						// Em vez de retornar um falso negativo (fallback silencioso cego),
+						// tenta manter a estabilidade. O ideal é retornar fallback com log se frauds < 0
+						unix.Write(fd, resp3)
 					}
 				} else {
 					unix.Write(fd, resp404)
