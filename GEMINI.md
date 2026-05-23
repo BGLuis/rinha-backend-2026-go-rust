@@ -23,9 +23,34 @@ Este projeto utiliza uma abordagem híbrida focada em performance extrema para o
 - **Estratégia de Warmup**: O sistema deve passar por um processo de aquecimento (min. 48 rodadas) para pre-faulting de memória e preenchimento de caches do kernel.
 
 ## Comandos Úteis (Makefile)
-- `make build`: Constrói as imagens.
-- `make smoke`: Teste rápido de fumaça.
-- `make test`: Teste de carga completo.
+- `make build`: Constrói as imagens Docker da stack.
+- `make restart-clean`: Reinicia a stack limpando estados e aguarda o warmup.
+- `make smoke`: Teste de fumaça (valida contrato e conectividade).
+- `make test`: **Teste Oficial da Rinha** (900 req/s, 120s).
+- `make test-precision`: Mede acurácia (FP/FN) sem ruído de throughput.
+- `make test-thermal`: Testa distribuição de clusters IVF e cache.
+- `make test-sustained`: Carga constante de 800 req/s por 6 minutos.
+- `make test-saturation`: Encontra o ponto de ruptura do sistema.
+- `make test-spike`: Avalia tempo de recuperação após sobrecarga.
+- `make heavy-test`: Stress extremo com picos de até 8000 req/s.
+- `make all-tests`: Executa toda a bateria de testes em sequência.
+
+## Testes e Validação
+A stack é validada por uma bateria de testes k6 customizados que garantem a performance sob condições extremas, além do teste oficial.
+
+### 1. Funcionalidade e Contrato
+- **`smoke.js`**: Valida se o endpoint `/fraud-score` respeita o contrato JSON e retorna `200 OK`.
+
+### 2. Acurácia e Engine Vetorial
+- **`precision_probe.js`**: Executa o dataset completo com baixa concorrência (4 VUs). Essencial para calibrar o `nprobe` do IVF e validar se o pré-processamento binário não introduziu distorções nos vetores.
+- **`cache_thermal.js`**: Força o acesso a fatias distintas do dataset simultaneamente. Valida se o sistema mantém o `p99` baixo mesmo quando clusters pesados do K-Means são solicitados em paralelo.
+
+### 3. Performance e Estresse
+- **`test.js` (Oficial)**: Alvo principal da competição. O sistema deve manter `p99 <= 1ms` até 900 req/s.
+- **`stress_sustained.js`**: Monitora a degradação ao longo de 6 minutos. Identifica problemas de pressão de GC no Go ou eviction de páginas `mmap` pelo SO.
+- **`saturation_finder.js`**: Escalonamento granular para identificar o limite real de throughput (req/s) antes da explosão da latência.
+- **`spike_recovery.js`**: Simula um "tsunami" de requisições seguido de queda brusca para medir o tempo que o kernel e a API levam para drenar os buffers e voltar ao baseline.
+- **`heavyTests.js`**: Teste de estresse agressivo (até 8000 req/s) para garantir a estabilidade do `io_uring` e dos Unix Sockets sob pressão máxima.
 
 ## Estratégia de Branches
 - `main`: Código-fonte completo e limpo.

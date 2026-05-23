@@ -1,4 +1,4 @@
-.PHONY: build up down restart logs smoke test docker-push docker-push-lb docker-push-all
+.PHONY: build up down restart restart-clean logs smoke test heavy-test test-precision test-thermal test-sustained test-saturation test-spike all-tests run-all docker-push-api docker-push-lb docker-push-all
 
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
@@ -18,21 +18,51 @@ down:
 restart:
 	$(DOCKER_COMPOSE) down && $(DOCKER_COMPOSE) up -d --build
 
+restart-clean:
+	$(DOCKER_COMPOSE) down
+	$(DOCKER_COMPOSE) up -d --build
+	@echo "Waiting for stack and warmup to complete..."
+	$(DOCKER_COMPOSE) wait warmup
+	@echo "Stack is ready."
+
 logs:
 	$(DOCKER_COMPOSE) logs -f
 
 smoke:
-	docker run --rm --network host -i $(K6_IMAGE) run - <test/smoke.js
+	docker-compose -f test/docker-compose.yml --profile smoke up
 
 test:
 	mkdir -p "$(PWD)/test"
 	touch "$(PWD)/test/results.json" && chmod 666 "$(PWD)/test/results.json"
-	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -w /test -i $(K6_IMAGE) run test.js
+	docker-compose -f test/docker-compose.yml --profile test up
 
 heavy-test:
 	mkdir -p "$(PWD)/test"
-	touch "$(PWD)/test/results.json" && chmod 666 "$(PWD)/test/results.json"
-	docker run --rm --network host -u $(shell id -u):$(shell id -g) -v "$(PWD)/test:/test" -w /test -i $(K6_IMAGE) run heavyTests.js
+	touch "$(PWD)/test/results_heavy.json" && chmod 666 "$(PWD)/test/results_heavy.json"
+	docker-compose -f test/docker-compose.yml --profile heavy up
+
+test-precision:
+	$(MAKE) test-sustained
+
+test-thermal:
+	mkdir -p "$(PWD)/test"
+	touch "$(PWD)/test/results_thermal.json" && chmod 666 "$(PWD)/test/results_thermal.json"
+	docker-compose -f test/docker-compose.yml --profile thermal up
+
+test-sustained:
+	mkdir -p "$(PWD)/test"
+	touch "$(PWD)/test/results_sustained.json" && chmod 666 "$(PWD)/test/results_sustained.json"
+	docker-compose -f test/docker-compose.yml --profile sustained up
+
+test-saturation:
+	mkdir -p "$(PWD)/test"
+	touch "$(PWD)/test/results_saturation.json" && chmod 666 "$(PWD)/test/results_saturation.json"
+	docker-compose -f test/docker-compose.yml --profile saturation up
+
+test-spike:
+	mkdir -p "$(PWD)/test"
+	touch "$(PWD)/test/results_spike.json" && chmod 666 "$(PWD)/test/results_spike.json"
+	docker-compose -f test/docker-compose.yml --profile spike up
 
 docker-push-api:
 	docker build -t $(API_IMAGE) .
@@ -44,6 +74,23 @@ docker-push-lb:
 
 docker-push-all: docker-push-api docker-push-lb
 
-run-all: restart
-	sleep 5
-	make smoke
+all-tests:
+	@echo "Running ALL tests in sequence from easiest to hardest..."
+	$(MAKE) restart-clean
+	$(MAKE) smoke
+	$(MAKE) restart-clean
+	$(MAKE) test-precision
+	$(MAKE) restart-clean
+	$(MAKE) test-thermal
+	$(MAKE) restart-clean
+	$(MAKE) test
+	$(MAKE) restart-clean
+	$(MAKE) test-sustained
+	$(MAKE) restart-clean
+	$(MAKE) test-saturation
+	$(MAKE) restart-clean
+	$(MAKE) test-spike
+	$(MAKE) restart-clean
+	$(MAKE) heavy-test
+
+run-all: all-tests
