@@ -58,6 +58,8 @@ fn main() -> std::io::Result<()> {
         cq.sync();
         
         let mut accepted_count = 0;
+        let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(16); up_addrs.len()];
+
         for cqe in cq {
             if cqe.user_data() == 1 {
                 let res = cqe.result();
@@ -68,13 +70,20 @@ fn main() -> std::io::Result<()> {
                         libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
                     }
 
-                    let target_addr = &up_addrs[rr % up_addrs.len()];
+                    let target_idx = rr % up_addrs.len();
+                    batches[target_idx].push(client_fd);
                     rr = rr.wrapping_add(1);
-
-                    send_fd(uds_fd, target_addr, client_fd);
-                    unsafe { libc::close(client_fd); }
                 }
                 accepted_count += 1;
+            }
+        }
+
+        for (i, batch) in batches.iter().enumerate() {
+            if !batch.is_empty() {
+                for chunk in batch.chunks(16) {
+                    send_fds(uds_fd, &up_addrs[i], chunk);
+                }
+                for &fd in batch { unsafe { libc::close(fd); } }
             }
         }
         
@@ -93,7 +102,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int) {
+fn send_fds(sock: libc::c_int, addr: &libc::sockaddr_un, fds: &[libc::c_int]) {
     unsafe {
         let mut msg: libc::msghdr = mem::zeroed();
         msg.msg_name = addr as *const _ as *mut libc::c_void;
@@ -103,17 +112,18 @@ fn send_fd(sock: libc::c_int, addr: &libc::sockaddr_un, fd_to_send: libc::c_int)
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
 
-        let mut cmsg_buf = [0u8; 24];
+        let mut cmsg_buf = [0u8; 128];
         msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = 24;
+        msg.msg_controllen = cmsg_buf.len() as _;
 
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if !cmsg.is_null() {
-            (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<libc::c_int>() as u32) as _;
+            let fd_size = (fds.len() * mem::size_of::<libc::c_int>()) as u32;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size) as _;
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
-            *data = fd_to_send;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
             msg.msg_controllen = (*cmsg).cmsg_len;
         }
 

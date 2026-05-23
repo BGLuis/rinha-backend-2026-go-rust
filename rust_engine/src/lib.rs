@@ -151,7 +151,10 @@ unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offset
     for bi in 0..num_blocks {
         let block_ptr = base_ptr.add(bi * 256);
         #[cfg(target_arch = "x86_64")]
-        _mm_prefetch(base_ptr.add((bi + 4) * 256) as *const i8, _MM_HINT_T0);
+        {
+            _mm_prefetch(base_ptr.add((bi + 4) * 256) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(base_ptr.add((bi + 1) * 256 + 224) as *const i8, _MM_HINT_T0);
+        }
 
         let mut acc = _mm256_setzero_ps();
         for d in 0..8 {
