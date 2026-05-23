@@ -121,6 +121,12 @@ export function handleSummary(data) {
     const httpDuration = data.metrics.http_req_duration.values;
     const p99 = httpDuration['p(99)'];
 
+    const reqWaiting = data.metrics.http_req_waiting ? data.metrics.http_req_waiting.values : {};
+    const reqConnecting = data.metrics.http_req_connecting ? data.metrics.http_req_connecting.values : {};
+    const reqTlsHandshaking = data.metrics.http_req_tls_handshaking ? data.metrics.http_req_tls_handshaking.values : {};
+    const fpScore = data.metrics.fp_score ? data.metrics.fp_score.values : {};
+    const fnScore = data.metrics.fn_score ? data.metrics.fn_score.values : {};
+
     const tp = data.metrics.tp_count ? data.metrics.tp_count.values.count : 0;
     const tn = data.metrics.tn_count ? data.metrics.tn_count.values.count : 0;
     const fp = data.metrics.fp_count ? data.metrics.fp_count.values.count : 0;
