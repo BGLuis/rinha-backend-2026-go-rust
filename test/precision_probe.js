@@ -1,5 +1,21 @@
+// precision_probe.js — Sonda de precisão de detecção com carga mínima.
+//
+// Objetivo: percorrer o dataset COMPLETO em baixa concorrência (4 VUs)
+// para medir a taxa de detecção sem ruído de throughput. Útil para:
+//
+//   1. Verificar se otimizações de nprobe/vectorização mudaram FP/FN
+//   2. Identificar qual fração do dataset produz mais erros (por VU offset)
+//   3. Medir a latência "base" sem pressão de concorrência
+//
+// Com 4 VUs e 54.100 entries, cada VU processa ~13.525 entries sequencialmente.
+// O tempo esperado: ~54.100 / (4 VUs × throughput_1VU). Em média, cada VU
+// faz ~1 req/s com timeout conservador → ~3h. Use maxDuration para cortar.
+// Recomendado: ajustar maxDuration para o tempo disponível.
+//
+// Execute: k6 run test/precision_probe.js
+// NÃO modifica test.js (proibido pela organização).
+
 import http from 'k6/http';
-import { check } from 'k6';
 import { SharedArray } from 'k6/data';
 import { Counter } from 'k6/metrics';
 import { textSummary } from './k6-summary.js';
@@ -13,62 +29,50 @@ const statsArr = new SharedArray('test-stats', function () {
 });
 const expectedStats = statsArr[0];
 
-const tpCount = new Counter('tp_count');
-const tnCount = new Counter('tn_count');
-const fpCount = new Counter('fp_count');
-const fnCount = new Counter('fn_count');
+const tpCount    = new Counter('tp_count');
+const tnCount    = new Counter('tn_count');
+const fpCount    = new Counter('fp_count');
+const fnCount    = new Counter('fn_count');
 const errorCount = new Counter('error_count');
 
+// Número de VUs — cada VU percorre uma fatia sequencial do dataset
+const NUM_VUS = 4;
+
 export const options = {
-	summaryTrendStats: ['p(99)'],
+	summaryTrendStats: ['p(50)', 'p(95)', 'p(99)', 'max', 'avg'],
 	systemTags: ['status', 'method'],
-	dns: {
-		ttl: '5m',
-		select: 'roundRobin',
-	},
 	scenarios: {
-		// Cenário 1: Carga Base Constante (Simula tráfego normal)
-		base_load: {
-			executor: 'constant-arrival-rate',
-			rate: 1000,
-			timeUnit: '1s',
-			duration: '120s',
-			preAllocatedVUs: 200,
-			maxVUs: 1500,
-		},
-		// Cenário 2: Picos Agressivos Paralelos (Stress e Elasticidade)
-		spike_load: {
-			executor: 'ramping-arrival-rate',
-			startRate: 0,
-			timeUnit: '1s',
-			startTime: '10s', // Inicia 10s após a base
-			preAllocatedVUs: 100,
-			maxVUs: 4000,
-			stages: [
-				{ duration: '10s', target: 4000 }, // Pico rápido (Spike)
-				{ duration: '15s', target: 4000 }, // Sustenta o pico
-				{ duration: '15s', target: 1000 }, // Desce rápido
-				{ duration: '20s', target: 8000 }, // Tsunami (Stress extremo)
-				{ duration: '30s', target: 8000 }, // Sustenta o Tsunami
-				{ duration: '20s', target: 0 },    // Cooldown
-			],
+		// per-vu-iterations: cada VU faz N iterações sequencialmente.
+		// O offset por VU garante que o dataset seja coberto sem sobreposição.
+		precision: {
+			executor: 'per-vu-iterations',
+			vus: NUM_VUS,
+			// Divide o dataset entre as VUs (ceiling para cobrir tudo)
+			iterations: Math.ceil(testData.length / NUM_VUS),
+			maxDuration: '30m', // Corte de segurança; ajuste conforme necessário
 		},
 	},
 };
 
 export function setup() {
+	const perVu = Math.ceil(testData.length / NUM_VUS);
 	console.log(
-		`Dataset: ${expectedStats.total} entries, ` +
-			`${expectedStats.fraud_count} fraud (${expectedStats.fraud_rate}%), ` +
-			`${expectedStats.legit_count} legit (${expectedStats.legit_rate}%), ` +
-			`edge cases: ${expectedStats.edge_case_rate}%`,
+		`[precision_probe] Dataset: ${testData.length} entries ÷ ${NUM_VUS} VUs ` +
+		`= ${perVu} entries/VU. Carga mínima — sem pressão de throughput.`,
 	);
+	console.log('Meta: identificar FP/FN sem ruído de concorrência.');
 }
 
 export default function () {
-	// Usa módulo para ciclar pelo array indefinidamente durante a carga agressiva
-	const idx = exec.scenario.iterationInTest % testData.length;
-	const entry = testData[idx];
+	// Cada VU acessa uma fatia não-sobreposta e sequencial do dataset
+	const vuIndex     = exec.vu.idInTest % NUM_VUS;      // 0, 1, 2, 3
+	const sliceStart  = vuIndex * Math.ceil(testData.length / NUM_VUS);
+	const idx         = sliceStart + exec.vu.iterationInInstance;
+
+	// Guarda-rail: não acessa além dos limites do dataset
+	if (idx >= testData.length) return;
+
+	const entry            = testData[idx];
 	const expectedApproved = entry.expected_approved;
 
 	const res = http.post(
@@ -77,33 +81,26 @@ export default function () {
 		{ headers: { 'Content-Type': 'application/json' }, timeout: '2001ms' },
 	);
 
-	if (res.status !== 200) {
-		console.error(`[ERROR ALERT] Non-200 response: ${res.status} for transaction ${entry.request.id}`);
-	}
-
-	if (exec.scenario.name === 'spike_load') {
-		const elapsed = Date.now() - exec.scenario.startTime;
-		if (elapsed > 50000 && elapsed < 100000 && res.timings.duration > 20) {
-			console.warn(`[LATENCY ALERT] High latency during tsunami: ${res.timings.duration}ms at ${Math.round(elapsed/1000)}s`);
-		}
-	}
-
 	if (res.status === 200) {
 		const body = JSON.parse(res.body);
-		// Per-request scoring: compare against expectedApproved
-		// expectedApproved === true  --> legit transaction
-		// expectedApproved === false --> fraud transaction
 		if (expectedApproved === body.approved) {
-			if (body.approved)
-				tnCount.add(1); // correctly approved legit
-			else tpCount.add(1); // correctly denied fraud
+			if (body.approved) tnCount.add(1);
+			else               tpCount.add(1);
 		} else {
-			if (body.approved)
-				fnCount.add(1); // fraud approved (missed fraud)
-			else fpCount.add(1); // legit denied (false block)
+			// Log individual de classificação errada para debug
+			const req = entry.request;
+			const msg = `ID=${req.id} expected=${expectedApproved} actual=${body.approved} score=${body.fraud_score} amount=${req.transaction.amount} mcc=${req.merchant.mcc}`;
+			if (body.approved) {
+				fnCount.add(1); // fraude aprovada
+				console.log(`FN ${msg}`);
+			} else {
+				fpCount.add(1); // legítima negada
+				console.log(`FP ${msg}`);
+			}
 		}
 	} else {
 		errorCount.add(1);
+		console.log(`ERROR at idx=${idx}: status=${res.status}`);
 	}
 }
 
@@ -168,7 +165,7 @@ export function handleSummary(data) {
     const finalScore = p99Score + detScore;
 
     const result = {
-        scenario: 'heavy_test',
+        scenario: 'precision_probe',
         expected: expectedStats,
         p99: r(p99, PRECISION) + 'ms',
         diagnostics: {
@@ -186,6 +183,16 @@ export function handleSummary(data) {
                 p95: r(reqTlsHandshaking['p(95)'] || 0, PRECISION),
                 p99: r(reqTlsHandshaking['p(99)'] || 0, PRECISION),
                 p999: r(reqTlsHandshaking['p(99.9)'] || 0, PRECISION),
+            },
+            fp_score: {
+                min: r(fpScore.min || 0, PRECISION),
+                max: r(fpScore.max || 0, PRECISION),
+                avg: r(fpScore.avg || 0, PRECISION),
+            },
+            fn_score: {
+                min: r(fnScore.min || 0, PRECISION),
+                max: r(fnScore.max || 0, PRECISION),
+                avg: r(fnScore.avg || 0, PRECISION),
             }
         },
         scoring: {
@@ -224,7 +231,7 @@ export function handleSummary(data) {
     };
 
     return {
-        'test/results_heavy.json': JSON.stringify(result, null, 2),
+        'test/results_precision.json': JSON.stringify(result, null, 2),
         stdout: textSummary(data, { indent: ' ', enableColors: true }),
     };
 }
