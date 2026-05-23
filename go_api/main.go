@@ -55,6 +55,7 @@ var (
 	txID3 = []byte(`"tx-2943266944"`)
 	txID4 = []byte(`"tx-2466999149"`)
 	txID5 = []byte(`"tx-2670248037"`)
+	crlf  = []byte("\r\n\r\n")
 )
 
 var queryPool = sync.Pool{
@@ -136,9 +137,9 @@ var paths = [][]string{
 	{"last_transaction", "km_from_current"},
 }
 
-func fastParseTimeStr(s []byte) time.Time {
+func fastParseTimeStr(s []byte) (int64, int, int) {
 	if len(s) < 19 {
-		return time.Time{}
+		return 0, 0, 0
 	}
 	year := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
 	month := int(s[5]-'0')*10 + int(s[6]-'0')
@@ -146,7 +147,19 @@ func fastParseTimeStr(s []byte) time.Time {
 	hour := int(s[11]-'0')*10 + int(s[12]-'0')
 	min := int(s[14]-'0')*10 + int(s[15]-'0')
 	sec := int(s[17]-'0')*10 + int(s[18]-'0')
-	return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
+	
+	if month <= 2 {
+		year--
+		month += 12
+	}
+	days := 365*year + year/4 - year/100 + year/400 + (153*month+8)/5 + day - 719562
+	weekday := (days + 4) % 7
+	if weekday < 0 {
+		weekday += 7
+	}
+	unixEpoch := int64(days)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
+	
+	return unixEpoch, hour, weekday
 }
 
 func fastVectorize(body []byte, q *[14]float32) {
@@ -195,9 +208,8 @@ func fastVectorize(body []byte, q *[14]float32) {
 		known = bytes.Contains(knownMerchBlock, merchId)
 	}
 
-	reqAt := fastParseTimeStr(reqAtBytes)
-	reqHour := reqAt.Hour()
-	reqWeekday := int(reqAt.Weekday()+6) % 7
+	reqUnix, reqHour, reqWeekdayTime := fastParseTimeStr(reqAtBytes)
+	reqWeekday := (reqWeekdayTime + 6) % 7
 
 	q[0] = round4(clamp(amt / MaxAmount))
 	q[1] = round4(clamp(float64(inst) / MaxInstallments))
@@ -213,8 +225,8 @@ func fastVectorize(body []byte, q *[14]float32) {
 		q[5] = -1.0
 		q[6] = -1.0
 	} else {
-		lastTs := fastParseTimeStr(lastTsBytes)
-		minutes := float64(reqAt.Unix()-lastTs.Unix()) / 60.0
+		lastUnix, _, _ := fastParseTimeStr(lastTsBytes)
+		minutes := float64(reqUnix - lastUnix) / 60.0
 		q[5] = round4(clamp(minutes / MaxMinutes))
 		q[6] = round4(clamp(kmLast / MaxKm))
 	}
@@ -348,18 +360,7 @@ func main() {
 
 				for _, client_fd := range fds {
 					unix.SetNonblock(client_fd, true)
-					
-					rn, err := unix.Read(client_fd, buf)
-					if err == nil && rn > 0 {
-						processRequest(client_fd, buf[:rn])
-						unix.Close(client_fd)
-					} else {
-						if err != nil && err != unix.EAGAIN && err != unix.EWOULDBLOCK {
-							unix.Close(client_fd)
-						} else {
-							unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
-						}
-					}
+					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
 				}
 				continue
 			}
@@ -394,7 +395,7 @@ func processRequest(fd int, data []byte) {
 	if len(data) >= 10 && string(data[:10]) == "GET /ready" {
 		unix.Write(fd, respReady)
 	} else if len(data) >= 17 && string(data[:17]) == "POST /fraud-score" {
-		bodyIdx := bytes.Index(data, []byte("\r\n\r\n"))
+		bodyIdx := bytes.Index(data, crlf)
 		if bodyIdx != -1 {
 			body := data[bodyIdx+4:]
 			q := queryPool.Get().(*[14]float32)
