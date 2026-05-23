@@ -74,20 +74,31 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     let mut centroid_dists = [(0.0f32, 0usize); 4096];
     let n_centroids = std::cmp::min(num_k, 4096);
 
-    let q_simd: [__m256; 2] = [
-        _mm256_loadu_ps(q.as_ptr()),
-        _mm256_loadu_ps(q.as_ptr().add(8))
-    ];
-
-    for ki in (0..n_centroids).step_by(1) {
-        let d2 = dist_sq_f32_arch(q.as_ptr(), centroids[ki].as_ptr());
-        centroid_dists[ki] = (d2, ki);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let q_v = _mm256_loadu_ps(q.as_ptr());
+        let q_v2 = _mm256_loadu_ps(q.as_ptr().add(8));
+        for ki in 0..n_centroids {
+            let p_v = _mm256_loadu_ps(centroids[ki].as_ptr());
+            let diff = _mm256_sub_ps(q_v, p_v);
+            let mut sq = _mm256_mul_ps(diff, diff);
+            let p_v2 = _mm256_loadu_ps(centroids[ki].as_ptr().add(8));
+            let diff2 = _mm256_sub_ps(q_v2, p_v2);
+            sq = _mm256_fmadd_ps(diff2, diff2, sq);
+            centroid_dists[ki] = (hsum_ps_avx(sq), ki);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        for ki in 0..n_centroids {
+            let d2 = dist_sq_f32_arch(q.as_ptr(), centroids[ki].as_ptr());
+            centroid_dists[ki] = (d2, ki);
+        }
     }
 
     let sub = &mut centroid_dists[0..n_centroids];
     sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let nprobe = if force_deep == 1 { 192 } else { 32 };
+    let nprobe = if force_deep == 1 { 192 } else { 64 };
 
     let mut q_i16 = [0i16; 16];
     for d in 0..14 {
@@ -140,7 +151,7 @@ unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offset
     for bi in 0..num_blocks {
         let block_ptr = base_ptr.add(bi * 256);
         #[cfg(target_arch = "x86_64")]
-        _mm_prefetch(base_ptr.add((bi + 2) * 256) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(base_ptr.add((bi + 4) * 256) as *const i8, _MM_HINT_T0);
 
         let mut acc = _mm256_setzero_ps();
         for d in 0..8 {
