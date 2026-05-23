@@ -12,11 +12,15 @@ Este projeto utiliza uma abordagem híbrida focada em performance extrema para o
 - **Interoperabilidade**: Comunicação via **CGO** passando ponteiros de memória (`unsafe.Pointer`) para evitar cópias.
 - **Otimização de Memória**: Utiliza `mmap` compartilhado para carregar o dataset de 3M vetores. **O uso de `MAP_SHARED` é obrigatório** para permitir que múltiplas instâncias compartilhem a mesma memória física.
 - **Aceleração de Hardware**: Compilação em Rust com flags para **AVX2** e **FMA**. Uso de **Int16 SIMD Quantization**.
+- **Batching UDS (IPC)**: O proxy Rust repassa conexões (FDs) para a API Go em blocos usando `SCM_RIGHTS`, cortando chamadas de sistema (syscalls) na barreira Go-Rust em mais de 90%.
+- **Otimizações Extremas da API Go**:
+    - **Aritmética de Epoch Direta**: Substituição de parsers padrão (`time.Date`) por matemática escalar nativa para evitar *Garbage Collection* e *locks* de *Timezone*.
+    - **Routing sem GC**: Roteamento HTTP via variáveis zero-copy e ponteiros diretos (`crlf` globais).
 
 ## Convenções de Desenvolvimento & Infra
 - **Zero-Allocation**: Nunca use `json.Marshal` ou `json.Unmarshal` no handler `/fraud-score`.
-- **Unix Sockets**: A comunicação entre o Load Balancer e a API deve ser via **Unix Domain Sockets** em `/tmp/sockets`.
-- **tmpfs para Sockets**: O diretório de sockets deve ser montado como **`tmpfs`** para evitar latência de disco.
+- **Nenhum pacote `time` nativo**: Cálculos temporais no fluxo quente devem usar a função `fastUnix` escalar, preservando microssegundos preciosos.
+- **Unix Sockets & Batching**: A comunicação entre o Load Balancer e a API deve ser via **Unix Domain Sockets** montados em `/tmp/sockets` (diretório `tmpfs`). O LB envia *File Descriptors* em massa em lotes (chunks) de até 16.
 - **Ulimits Mandatórios**:
     - `nofile: 65535` para suportar alta concorrência.
     - `memlock: -1` para permitir o bloqueio de páginas do dataset em RAM física via `mmap`.
