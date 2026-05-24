@@ -56,6 +56,8 @@ var (
 	txID4 = []byte(`"tx-2466999149"`)
 	txID5 = []byte(`"tx-2670248037"`)
 	crlf  = []byte("\r\n\r\n")
+	getReady = []byte("GET /ready")
+	postFraudScore = []byte("POST /fraud-score")
 )
 
 var queryPool = sync.Pool{
@@ -328,7 +330,7 @@ func main() {
 
 	events := make([]unix.EpollEvent, 4096)
 	buf := make([]byte, 8192)
-	oob := make([]byte, unix.CmsgSpace(4))
+	oob := make([]byte, unix.CmsgSpace(16*4)) // Space for up to 16 FDs batched by rust_lb
 	dummy := make([]byte, 1)
 
 	for {
@@ -360,7 +362,16 @@ func main() {
 
 				for _, client_fd := range fds {
 					unix.SetNonblock(client_fd, true)
-					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+					
+					rn, err := unix.Read(client_fd, buf)
+					if err == nil && rn > 0 {
+						processRequest(client_fd, buf[:rn])
+						unix.Close(client_fd)
+					} else if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+						unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+					} else {
+						unix.Close(client_fd)
+					}
 				}
 				continue
 			}
@@ -392,9 +403,9 @@ func main() {
 func processRequest(fd int, data []byte) {
 	atomic.AddUint64(&reqCount, 1)
 
-	if len(data) >= 10 && string(data[:10]) == "GET /ready" {
+	if bytes.HasPrefix(data, getReady) {
 		unix.Write(fd, respReady)
-	} else if len(data) >= 17 && string(data[:17]) == "POST /fraud-score" {
+	} else if bytes.HasPrefix(data, postFraudScore) {
 		bodyIdx := bytes.Index(data, crlf)
 		if bodyIdx != -1 {
 			body := data[bodyIdx+4:]

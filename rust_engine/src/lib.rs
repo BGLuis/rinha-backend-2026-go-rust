@@ -97,8 +97,18 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     }
 
     let sub = &mut centroid_dists[0..n_centroids];
-    sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let nprobe = if force_deep == 1 { 192 } else { 64 };
+    
+    if nprobe > 0 && nprobe <= sub.len() {
+        sub.select_nth_unstable_by(nprobe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // We only strictly need the top `nprobe` elements to be in the first `nprobe` positions,
+        // but sorting them can help slightly with cache locality for the bboxes check if they are near each other.
+        // Even without sorting the slice of top nprobe, it's valid, but let's sort the top part just in case.
+        let top_nprobe = &mut sub[0..nprobe];
+        top_nprobe.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
 
     let mut q_i16 = [0i16; 16];
     for d in 0..14 {

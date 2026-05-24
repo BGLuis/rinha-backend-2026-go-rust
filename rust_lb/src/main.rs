@@ -12,9 +12,6 @@ fn main() -> std::io::Result<()> {
     let upstreams: Vec<String> = upstreams_env.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
 
     let listen_fd = create_listener(port, DEFAULT_BACKLOG)?;
-    unsafe {
-        libc::fcntl(listen_fd, libc::F_SETFL, libc::O_NONBLOCK);
-    }
 
     // UDS socket MUST be BLOCKING to provide backpressure and avoid dropping FDs
     let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -53,7 +50,11 @@ fn main() -> std::io::Result<()> {
     ring.submit()?;
 
     loop {
-        ring.submit_and_wait(1)?;
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
         let mut cq = ring.completion();
         cq.sync();
         
