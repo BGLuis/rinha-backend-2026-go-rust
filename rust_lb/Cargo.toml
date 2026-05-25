@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-io-uring = "0.6"
+mio = { version = "0.8", features = ["os-poll", "net"] }
 
 [profile.release]
 lto = "fat"

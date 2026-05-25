@@ -1,17 +1,19 @@
 use std::ffi::CString;
 use std::mem;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr;
+use std::io::ErrorKind;
+
+use mio::net::TcpListener;
+use mio::{Events, Interest, Poll, Token};
 
 const DEFAULT_PORT: u16 = 9999;
-const DEFAULT_BACKLOG: i32 = 8192;
+const SERVER_TOKEN: Token = Token(0);
 
 fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT);
     let upstreams_env = std::env::var("UPSTREAMS").unwrap_or_else(|_| "".to_string());
     let upstreams: Vec<String> = upstreams_env.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
-
-    let listen_fd = create_listener(port, DEFAULT_BACKLOG)?;
 
     // UDS socket MUST be BLOCKING to provide backpressure and avoid dropping FDs
     let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -34,73 +36,65 @@ fn main() -> std::io::Result<()> {
         up_addrs.push(addr);
     }
 
-    let mut ring = io_uring::IoUring::new(1024)?;
+    let std_listener = create_listener(port, 8192)?;
+    let mut listener = TcpListener::from_std(std_listener);
+
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(4096);
+
+    poll.registry().register(&mut listener, SERVER_TOKEN, Interest::READABLE)?;
 
     let mut rr = 0;
-
-    let mut sq = ring.submission();
-    for _ in 0..128 {
-        let accept_e = io_uring::opcode::Accept::new(io_uring::types::Fd(listen_fd), ptr::null_mut::<libc::sockaddr>(), ptr::null_mut::<libc::socklen_t>())
-            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-            .build()
-            .user_data(1);
-        unsafe { sq.push(&accept_e).unwrap(); }
-    }
-    drop(sq);
-    ring.submit()?;
+    let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(16); up_addrs.len()];
 
     loop {
-        match ring.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => return Err(e),
+        if let Err(e) = poll.poll(&mut events, None) {
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
         }
-        let mut cq = ring.completion();
-        cq.sync();
-        
-        let mut accepted_count = 0;
-        let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(16); up_addrs.len()];
 
-        for cqe in cq {
-            if cqe.user_data() == 1 {
-                let res = cqe.result();
-                if res >= 0 {
-                    let client_fd = res;
-                    unsafe {
-                        let one: libc::c_int = 1;
-                        libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+        for event in events.iter() {
+            if event.token() == SERVER_TOKEN {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if let Err(_) = stream.set_nodelay(true) {
+                                continue;
+                            }
+                            
+                            let raw_fd = stream.into_raw_fd();
+                            let target_idx = rr % up_addrs.len();
+                            batches[target_idx].push(raw_fd);
+                            rr = rr.wrapping_add(1);
+                        }
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => {
+                            continue;
+                        }
+                        Err(_) => {
+                            break;
+                        }
                     }
-
-                    let target_idx = rr % up_addrs.len();
-                    batches[target_idx].push(client_fd);
-                    rr = rr.wrapping_add(1);
                 }
-                accepted_count += 1;
             }
         }
 
-        for (i, batch) in batches.iter().enumerate() {
+        for (i, batch) in batches.iter_mut().enumerate() {
             if !batch.is_empty() {
                 for chunk in batch.chunks(16) {
                     send_fds(uds_fd, &up_addrs[i], chunk);
                 }
-                for &fd in batch { unsafe { libc::close(fd); } }
-            }
-        }
-        
-        if accepted_count > 0 {
-            let mut sq = ring.submission();
-            for _ in 0..accepted_count {
-                let accept_e = io_uring::opcode::Accept::new(io_uring::types::Fd(listen_fd), ptr::null_mut::<libc::sockaddr>(), ptr::null_mut::<libc::socklen_t>())
-                    .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-                    .build()
-                    .user_data(1);
-                unsafe { sq.push(&accept_e).unwrap_or(()); }
+                for &fd in batch.iter() { 
+                    unsafe { libc::close(fd); } 
+                }
+                batch.clear();
             }
         }
     }
-    
-    Ok(())
 }
 
 fn send_fds(sock: libc::c_int, addr: &libc::sockaddr_un, fds: &[libc::c_int]) {
@@ -132,7 +126,7 @@ fn send_fds(sock: libc::c_int, addr: &libc::sockaddr_un, fds: &[libc::c_int]) {
     }
 }
 
-fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
+fn create_listener(port: u16, backlog: i32) -> std::io::Result<std::net::TcpListener> {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
     let one: libc::c_int = 1;
@@ -149,6 +143,9 @@ fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
         if libc::listen(fd, backlog) < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        
+        let std_listener = std::net::TcpListener::from_raw_fd(fd);
+        std_listener.set_nonblocking(true)?;
+        Ok(std_listener)
     }
-    Ok(fd)
 }
