@@ -9,7 +9,7 @@ use std::arch::x86_64::*;
 
 static mut DATASET_MMAP: Option<Mmap> = None;
 static mut CENTROIDS: Option<&'static [[f32; 16]]> = None;
-static mut BBOXES: Option<&'static [[i16; 32]]> = None;
+static mut BBOXES: Option<&'static [[f32; 32]]> = None;
 static mut OFFSETS: Option<&'static [u32]> = None;
 static mut SIZES: Option<&'static [u32]> = None;
 static mut NUM_CLUSTERS: usize = 0;
@@ -38,18 +38,31 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         let centroids_ptr = mmap.as_ptr().add(64) as *const [f32; 16];
         CENTROIDS = Some(slice::from_raw_parts(centroids_ptr, k));
 
-        let bboxes_ptr = mmap.as_ptr().add(64 + k * 64) as *const [i16; 32];
+        let bboxes_ptr = mmap.as_ptr().add(64 + k * 64) as *const [f32; 32];
         BBOXES = Some(slice::from_raw_parts(bboxes_ptr, k));
 
-        let offsets_ptr = mmap.as_ptr().add(64 + k * 64 + k * 64) as *const u32;
+        let offsets_ptr = mmap.as_ptr().add(64 + k * 64 + k * 128) as *const u32;
         OFFSETS = Some(slice::from_raw_parts(offsets_ptr, k));
 
-        let sizes_ptr = mmap.as_ptr().add(64 + k * 64 + k * 64 + k * 4) as *const u32;
+        let sizes_ptr = mmap.as_ptr().add(64 + k * 64 + k * 128 + k * 4) as *const u32;
         SIZES = Some(slice::from_raw_parts(sizes_ptr, k));
 
         DATASET_MMAP = Some(mmap);
         0
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn hsum_ps_avx(v: __m256) -> f32 {
+    let v_low = _mm256_castps256_ps128(v);
+    let v_high = _mm256_extractf128_ps(v, 1);
+    let v_add = _mm_add_ps(v_low, v_high);
+    let v_shuf = _mm_shuffle_ps(v_add, v_add, 0b10110001);
+    let v_add2 = _mm_add_ps(v_add, v_shuf);
+    let v_shuf2 = _mm_movehl_ps(v_shuf, v_add2);
+    let v_add3 = _mm_add_ps(v_add2, v_shuf2);
+    _mm_cvtss_f32(v_add3)
 }
 
 #[no_mangle]
@@ -91,7 +104,11 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     #[cfg(not(target_arch = "x86_64"))]
     {
         for ki in 0..n_centroids {
-            let d2 = dist_sq_f32_arch(q.as_ptr(), centroids[ki].as_ptr());
+            let mut d2 = 0.0f32;
+            for d in 0..14 {
+                let diff = q[d] - centroids[ki][d];
+                d2 += diff * diff;
+            }
             centroid_dists[ki] = (d2, ki);
         }
     }
@@ -101,37 +118,29 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     
     if nprobe > 0 && nprobe <= sub.len() {
         sub.select_nth_unstable_by(nprobe - 1, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        // We only strictly need the top `nprobe` elements to be in the first `nprobe` positions,
-        // but sorting them can help slightly with cache locality for the bboxes check if they are near each other.
-        // Even without sorting the slice of top nprobe, it's valid, but let's sort the top part just in case.
         let top_nprobe = &mut sub[0..nprobe];
         top_nprobe.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     } else {
         sub.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    let mut q_i16 = [0i16; 16];
-    for d in 0..14 {
-        q_i16[d] = (q[d] * 10000.0) as i16;
-    }
-
     for i in 0..nprobe {
         if i >= sub.len() { break; }
         let ki = sub[i].1;
-        if (min_dist_to_bbox_i32(&q_i16, &bboxes[ki]) as f32) * 0.00000001 > top_dists[4] { continue; }
-        scan_cluster_soa(ki, &q, mmap_ptr, offsets, sizes, &mut top_dists, &mut top_indices, &mut top_labels);
+        if min_dist_to_bbox_f32(&q, &bboxes[ki]) > top_dists[4] { continue; }
+        scan_cluster_aos(ki, &q, mmap_ptr, offsets, sizes, &mut top_dists, &mut top_indices, &mut top_labels);
     }
 
     top_labels.iter().sum::<u32>() as i32
 }
 
 #[inline(always)]
-unsafe fn min_dist_to_bbox_i32(q_i16: &[i16; 16], bbox: &[i16; 32]) -> i32 {
-    let mut dist2 = 0i32;
+unsafe fn min_dist_to_bbox_f32(q: &[f32; 16], bbox: &[f32; 32]) -> f32 {
+    let mut dist2 = 0f32;
     for d in 0..14 {
-        let b_min = bbox[d] as i32;
-        let b_max = bbox[d+16] as i32;
-        let qd = q_i16[d] as i32;
+        let b_min = bbox[d];
+        let b_max = bbox[d+16];
+        let qd = q[d];
         if qd < b_min {
             let diff = b_min - qd;
             dist2 += diff * diff;
@@ -144,110 +153,84 @@ unsafe fn min_dist_to_bbox_i32(q_i16: &[i16; 16], bbox: &[i16; 32]) -> i32 {
 }
 
 #[inline(always)]
-unsafe fn scan_cluster_soa(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offsets: &[u32], sizes: &[u32], top_dists: &mut [f32; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
+unsafe fn scan_cluster_aos(ki: usize, q: &[f32; 16], mmap_ptr: *const u8, offsets: &[u32], sizes: &[u32], top_dists: &mut [f32; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
     let n = sizes[ki] as usize;
     if n == 0 { return; }
-    let num_blocks = (n + 7) / 8;
-    let base_ptr = mmap_ptr.add(offsets[ki] as usize);
+    let base_ptr = mmap_ptr.add(offsets[ki] as usize) as *const f32;
 
-    let scale_inv = 10000.0f32;
-    let q_simd: [__m256; 14] = [
-        _mm256_set1_ps(q[0] * scale_inv), _mm256_set1_ps(q[1] * scale_inv), _mm256_set1_ps(q[2] * scale_inv), _mm256_set1_ps(q[3] * scale_inv),
-        _mm256_set1_ps(q[4] * scale_inv), _mm256_set1_ps(q[5] * scale_inv), _mm256_set1_ps(q[6] * scale_inv), _mm256_set1_ps(q[7] * scale_inv),
-        _mm256_set1_ps(q[8] * scale_inv), _mm256_set1_ps(q[9] * scale_inv), _mm256_set1_ps(q[10] * scale_inv), _mm256_set1_ps(q[11] * scale_inv),
-        _mm256_set1_ps(q[12] * scale_inv), _mm256_set1_ps(q[13] * scale_inv)
-    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        let q_v0 = _mm256_loadu_ps(q.as_ptr());
+        let q_v1 = _mm256_loadu_ps(q.as_ptr().add(8));
+        
+        let mask = _mm256_castsi256_ps(_mm256_set_epi32(0, 0, -1, -1, -1, -1, -1, -1));
 
-    for bi in 0..num_blocks {
-        let block_ptr = base_ptr.add(bi * 256);
-        #[cfg(target_arch = "x86_64")]
-        {
-            _mm_prefetch(base_ptr.add((bi + 4) * 256) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(base_ptr.add((bi + 1) * 256 + 224) as *const i8, _MM_HINT_T0);
-        }
+        for i in 0..n {
+            let record_ptr = base_ptr.add(i * 16);
+            let r_v0 = _mm256_loadu_ps(record_ptr);
+            let diff0 = _mm256_sub_ps(q_v0, r_v0);
+            let mut sq = _mm256_mul_ps(diff0, diff0);
+            
+            let r_v1 = _mm256_loadu_ps(record_ptr.add(8));
+            let diff1 = _mm256_sub_ps(q_v1, r_v1);
+            let mut sq1 = _mm256_mul_ps(diff1, diff1);
+            
+            sq1 = _mm256_and_ps(sq1, mask);
+            
+            sq = _mm256_add_ps(sq, sq1);
+            let d2 = hsum_ps_avx(sq);
 
-        let mut acc = _mm256_setzero_ps();
-        for d in 0..8 {
-            let v_i16 = _mm_loadu_si128(block_ptr.add(d * 16) as *const __m128i);
-            let v_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16));
-            let diff = _mm256_sub_ps(v_f32, q_simd[d]);
-            acc = _mm256_fmadd_ps(diff, diff, acc);
-        }
-
-        let threshold = _mm256_set1_ps(top_dists[4] * 100_000_000.0);
-        if _mm256_movemask_ps(_mm256_cmp_ps(acc, threshold, _CMP_GT_OQ)) == 0xFF {
-            continue;
-        }
-
-        for d in 8..14 {
-            let v_i16 = _mm_loadu_si128(block_ptr.add(d * 16) as *const __m128i);
-            let v_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v_i16));
-            let diff = _mm256_sub_ps(v_f32, q_simd[d]);
-            acc = _mm256_fmadd_ps(diff, diff, acc);
-        }
-
-        let acc_scaled = _mm256_mul_ps(acc, _mm256_set1_ps(0.00000001));
-        let dists: [f32; 8] = std::mem::transmute(acc_scaled);
-        let metas = slice::from_raw_parts(block_ptr.add(224) as *const u32, 8);
-
-        for i in 0..8 {
-            let d2 = dists[i];
             if d2 <= top_dists[4] {
-                let meta = metas[i];
+                let meta_f32 = *record_ptr.add(15);
+                let meta = meta_f32.to_bits();
                 let index = meta & 0x7FFFFFFF;
-                if index != 0x7FFFFFFF {
-                    insert_top5(d2, index, (meta >> 31) & 1, top_dists, top_indices, top_labels);
-                }
+                let label = (meta >> 31) & 1;
+                insert_top5(d2, index, label, top_dists, top_indices, top_labels);
+            }
+        }
+    }
+    
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        for i in 0..n {
+            let record_ptr = base_ptr.add(i * 16);
+            let mut d2 = 0.0f32;
+            for d in 0..14 {
+                let diff = q[d] - *record_ptr.add(d);
+                d2 += diff * diff;
+            }
+            if d2 <= top_dists[4] {
+                let meta_f32 = *record_ptr.add(15);
+                let meta = meta_f32.to_bits();
+                let index = meta & 0x7FFFFFFF;
+                let label = (meta >> 31) & 1;
+                insert_top5(d2, index, label, top_dists, top_indices, top_labels);
             }
         }
     }
 }
 
 #[inline(always)]
-unsafe fn dist_sq_f32_arch(q: *const f32, p: *const f32) -> f32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let q_v = _mm256_loadu_ps(q);
-        let p_v = _mm256_loadu_ps(p);
-        let diff = _mm256_sub_ps(q_v, p_v);
-        let mut sq = _mm256_mul_ps(diff, diff);
-        let q_v2 = _mm256_loadu_ps(q.add(8));
-        let p_v2 = _mm256_loadu_ps(p.add(8));
-        let diff2 = _mm256_sub_ps(q_v2, p_v2);
-        sq = _mm256_fmadd_ps(diff2, diff2, sq);
-        hsum_ps_avx(sq)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut d2 = 0.0f32;
-        for d in 0..14 {
-            let diff = *q.add(d) - *p.add(d);
-            d2 += diff * diff;
-        }
-        d2
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn hsum_ps_avx(v: __m256) -> f32 {
-    let x128 = _mm_add_ps(_mm256_extractf128_ps(v, 1), _mm256_castps256_ps128(v));
-    let x64 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
-    let x32 = _mm_add_ss(x64, _mm_shuffle_ps(x64, x64, 0x55));
-    _mm_cvtss_f32(x32)
-}
-
-#[inline(always)]
-fn insert_top5(dist: f32, index: u32, label: u32, dists: &mut [f32; 5], indices: &mut [u32; 5], labels: &mut [u32; 5]) {
-    let mut pos = 0;
-    while pos < 5 {
-        if dist < dists[pos] || (dist == dists[pos] && index < indices[pos]) { break; }
-        pos += 1;
-    }
-    if pos < 5 {
-        for i in (pos+1..5).rev() {
-            dists[i] = dists[i-1]; indices[i] = indices[i-1]; labels[i] = labels[i-1];
-        }
-        dists[pos] = dist; indices[pos] = index; labels[pos] = label;
+fn insert_top5(d2: f32, index: u32, label: u32, top_dists: &mut [f32; 5], top_indices: &mut [u32; 5], top_labels: &mut [u32; 5]) {
+    if d2 < top_dists[0] {
+        top_dists[4] = top_dists[3]; top_indices[4] = top_indices[3]; top_labels[4] = top_labels[3];
+        top_dists[3] = top_dists[2]; top_indices[3] = top_indices[2]; top_labels[3] = top_labels[2];
+        top_dists[2] = top_dists[1]; top_indices[2] = top_indices[1]; top_labels[2] = top_labels[1];
+        top_dists[1] = top_dists[0]; top_indices[1] = top_indices[0]; top_labels[1] = top_labels[0];
+        top_dists[0] = d2; top_indices[0] = index; top_labels[0] = label;
+    } else if d2 < top_dists[1] {
+        top_dists[4] = top_dists[3]; top_indices[4] = top_indices[3]; top_labels[4] = top_labels[3];
+        top_dists[3] = top_dists[2]; top_indices[3] = top_indices[2]; top_labels[3] = top_labels[2];
+        top_dists[2] = top_dists[1]; top_indices[2] = top_indices[1]; top_labels[2] = top_labels[1];
+        top_dists[1] = d2; top_indices[1] = index; top_labels[1] = label;
+    } else if d2 < top_dists[2] {
+        top_dists[4] = top_dists[3]; top_indices[4] = top_indices[3]; top_labels[4] = top_labels[3];
+        top_dists[3] = top_dists[2]; top_indices[3] = top_indices[2]; top_labels[3] = top_labels[2];
+        top_dists[2] = d2; top_indices[2] = index; top_labels[2] = label;
+    } else if d2 < top_dists[3] {
+        top_dists[4] = top_dists[3]; top_indices[4] = top_indices[3]; top_labels[4] = top_labels[3];
+        top_dists[3] = d2; top_indices[3] = index; top_labels[3] = label;
+    } else if d2 < top_dists[4] {
+        top_dists[4] = d2; top_indices[4] = index; top_labels[4] = label;
     }
 }

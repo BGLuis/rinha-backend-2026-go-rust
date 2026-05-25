@@ -23,7 +23,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/buger/jsonparser"
 	"golang.org/x/sys/unix"
 )
 
@@ -122,21 +121,72 @@ func round4(v float32) float32 {
 	return float32(int(v*10000.0+0.5)) / 10000.0
 }
 
-var paths = [][]string{
-	{"transaction", "amount"},
-	{"transaction", "installments"},
-	{"transaction", "requested_at"},
-	{"customer", "avg_amount"},
-	{"customer", "tx_count_24h"},
-	{"customer", "known_merchants"},
-	{"merchant", "id"},
-	{"merchant", "mcc"},
-	{"merchant", "avg_amount"},
-	{"terminal", "is_online"},
-	{"terminal", "card_present"},
-	{"terminal", "km_from_home"},
-	{"last_transaction", "timestamp"},
-	{"last_transaction", "km_from_current"},
+func parseFloat(b []byte, start int) (float64, int) {
+	for start < len(b) && (b[start] == ' ' || b[start] == ':') {
+		start++
+	}
+	var v float64
+	var dec float64 = 1
+	var inDec bool
+	var sign float64 = 1
+	if start < len(b) && b[start] == '-' {
+		sign = -1
+		start++
+	}
+	for ; start < len(b); start++ {
+		c := b[start]
+		if c >= '0' && c <= '9' {
+			if inDec {
+				dec *= 10
+				v += float64(c-'0') / dec
+			} else {
+				v = v*10 + float64(c-'0')
+			}
+		} else if c == '.' {
+			inDec = true
+		} else {
+			break
+		}
+	}
+	return v * sign, start
+}
+
+func parseBool(b []byte, start int) (bool, int) {
+	for start < len(b) && (b[start] == ' ' || b[start] == ':') {
+		start++
+	}
+	if start < len(b) && b[start] == 't' {
+		return true, start + 4
+	}
+	return false, start + 5
+}
+
+func parseString(b []byte, start int) ([]byte, int) {
+	for start < len(b) && (b[start] == ' ' || b[start] == ':' || b[start] == '"') {
+		start++
+	}
+	end := start
+	for end < len(b) && b[end] != '"' {
+		end++
+	}
+	if end < len(b) {
+		return b[start:end], end + 1
+	}
+	return b[start:end], end
+}
+
+func parseArray(b []byte, start int) ([]byte, int) {
+	for start < len(b) && (b[start] == ' ' || b[start] == ':' || b[start] == '[') {
+		start++
+	}
+	end := start
+	for end < len(b) && b[end] != ']' {
+		end++
+	}
+	if end < len(b) {
+		return b[start:end], end + 1
+	}
+	return b[start:end], end
 }
 
 func fastParseTimeStr(s []byte) (int64, int, int) {
@@ -170,40 +220,64 @@ func fastVectorize(body []byte, q *[14]float32) {
 	var reqAtBytes, merchId, mccBytes, lastTsBytes, knownMerchBlock []byte
 	var isOnline, cardPresent, hasLastTx bool
 
-	jsonparser.EachKey(body, func(idx int, value []byte, vt jsonparser.ValueType, err error) {
-		switch idx {
-		case 0:
-			amt, _ = jsonparser.ParseFloat(value)
-		case 1:
-			inst, _ = jsonparser.ParseInt(value)
-		case 2:
-			reqAtBytes = value
-		case 3:
-			cAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 4:
-			txCount, _ = jsonparser.ParseInt(value)
-		case 5:
-			// Extraindo o conteúdo literal da lista JSON sem aspas
-			knownMerchBlock = value
-		case 6:
-			merchId = value
-		case 7:
-			mccBytes = value
-		case 8:
-			mAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 9:
-			isOnline, _ = jsonparser.ParseBoolean(value)
-		case 10:
-			cardPresent, _ = jsonparser.ParseBoolean(value)
-		case 11:
-			kmHome, _ = jsonparser.ParseFloat(value)
-		case 12:
-			lastTsBytes = value
-			hasLastTx = true
-		case 13:
-			kmLast, _ = jsonparser.ParseFloat(value)
-		}
-	}, paths...)
+	iAmt := bytes.Index(body, []byte(`"amount"`))
+	if iAmt != -1 { amt, _ = parseFloat(body, iAmt+8) }
+	
+	iInst := bytes.Index(body, []byte(`"installments"`))
+	if iInst != -1 { instFloat, _ := parseFloat(body, iInst+14); inst = int64(instFloat) }
+	
+	iReqAt := bytes.Index(body, []byte(`"requested_at"`))
+	if iReqAt != -1 { reqAtBytes, _ = parseString(body, iReqAt+14) }
+	
+	iCust := bytes.Index(body, []byte(`"customer"`))
+	if iCust != -1 {
+		custBody := body[iCust:]
+		iCAvg := bytes.Index(custBody, []byte(`"avg_amount"`))
+		if iCAvg != -1 { cAvgAmt, _ = parseFloat(custBody, iCAvg+12) }
+		
+		iTxCount := bytes.Index(custBody, []byte(`"tx_count_24h"`))
+		if iTxCount != -1 { txf, _ := parseFloat(custBody, iTxCount+14); txCount = int64(txf) }
+		
+		iKnown := bytes.Index(custBody, []byte(`"known_merchants"`))
+		if iKnown != -1 { knownMerchBlock, _ = parseArray(custBody, iKnown+17) }
+	}
+	
+	iMerch := bytes.Index(body, []byte(`"merchant"`))
+	if iMerch != -1 {
+		merchBody := body[iMerch:]
+		iMId := bytes.Index(merchBody, []byte(`"id"`))
+		if iMId != -1 { merchId, _ = parseString(merchBody, iMId+4) }
+		
+		iMcc := bytes.Index(merchBody, []byte(`"mcc"`))
+		if iMcc != -1 { mccBytes, _ = parseString(merchBody, iMcc+5) }
+		
+		iMAvg := bytes.Index(merchBody, []byte(`"avg_amount"`))
+		if iMAvg != -1 { mAvgAmt, _ = parseFloat(merchBody, iMAvg+12) }
+	}
+	
+	iTerm := bytes.Index(body, []byte(`"terminal"`))
+	if iTerm != -1 {
+		termBody := body[iTerm:]
+		iOnline := bytes.Index(termBody, []byte(`"is_online"`))
+		if iOnline != -1 { isOnline, _ = parseBool(termBody, iOnline+11) }
+		
+		iCard := bytes.Index(termBody, []byte(`"card_present"`))
+		if iCard != -1 { cardPresent, _ = parseBool(termBody, iCard+14) }
+		
+		iKmHome := bytes.Index(termBody, []byte(`"km_from_home"`))
+		if iKmHome != -1 { kmHome, _ = parseFloat(termBody, iKmHome+14) }
+	}
+	
+	iLast := bytes.Index(body, []byte(`"last_transaction"`))
+	if iLast != -1 {
+		hasLastTx = true
+		lastBody := body[iLast:]
+		iLastTs := bytes.Index(lastBody, []byte(`"timestamp"`))
+		if iLastTs != -1 { lastTsBytes, _ = parseString(lastBody, iLastTs+11) }
+		
+		iKmLast := bytes.Index(lastBody, []byte(`"km_from_current"`))
+		if iKmLast != -1 { kmLast, _ = parseFloat(lastBody, iKmLast+17) }
+	}
 
 	known := false
 	if len(knownMerchBlock) > 0 && len(merchId) > 0 {

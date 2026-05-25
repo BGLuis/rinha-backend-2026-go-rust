@@ -12,8 +12,6 @@ struct RawEntry {
 }
 
 struct Entry {
-    v_i16: [i16; 16],
-    meta: u32,
     v_f32: [f32; 16],
 }
 
@@ -47,15 +45,14 @@ fn main() {
     println!("Loaded {} entries", raw_entries.len());
 
     let entries: Vec<Entry> = raw_entries.into_par_iter().enumerate().map(|(i, e)| {
-        let mut v_i16 = [0i16; 16];
         let mut v_f32 = [0.0f32; 16];
         for d in 0..14 {
-            v_i16[d] = (e.vector[d] * 10000.0).round() as i16;
             v_f32[d] = e.vector[d];
         }
         let label_bit = if e.label == "fraud" { 1u32 } else { 0u32 };
         let meta = (label_bit << 31) | (i as u32 & 0x7FFFFFFF);
-        Entry { v_i16, meta, v_f32 }
+        v_f32[15] = f32::from_bits(meta);
+        Entry { v_f32 }
     }).collect();
 
     let k = 4096;
@@ -67,7 +64,7 @@ fn main() {
         .map(|e| e.v_f32)
         .collect();
 
-    // Ensure we have exactly k centroids even if we have fewer entries (unlikely but safe)
+    // Ensure we have exactly k centroids
     while centroids.len() < k {
         centroids.push([0.0f32; 16]);
     }
@@ -140,14 +137,14 @@ fn main() {
         clusters[ki].push(&entries[i]);
     }
 
-    let mut bboxes = vec![[0i16; 32]; k];
+    let mut bboxes = vec![[0f32; 32]; k];
     for ki in 0..k {
-        let mut mins = [i16::MAX; 16];
-        let mut maxs = [i16::MIN; 16];
+        let mut mins = [f32::MAX; 16];
+        let mut maxs = [f32::MIN; 16];
         for e in &clusters[ki] {
-            for d in 0..16 {
-                if e.v_i16[d] < mins[d] { mins[d] = e.v_i16[d]; }
-                if e.v_i16[d] > maxs[d] { maxs[d] = e.v_i16[d]; }
+            for d in 0..14 {
+                if e.v_f32[d] < mins[d] { mins[d] = e.v_f32[d]; }
+                if e.v_f32[d] > maxs[d] { maxs[d] = e.v_f32[d]; }
             }
         }
         bboxes[ki][0..16].copy_from_slice(&mins);
@@ -161,7 +158,7 @@ fn main() {
     // Header (64 bytes)
     let mut header = [0u32; 16];
     header[0] = 0x4E495452; // "NITR"
-    header[1] = 2; // version 2 (SoA layout)
+    header[1] = 3; // version 3 (AoS layout f32)
     header[2] = k as u32;
     header[3] = entries.len() as u32;
     
@@ -178,21 +175,20 @@ fn main() {
         writer.write_all(c_u8).unwrap();
     }
 
-    // BBoxes (k * 64 bytes)
+    // BBoxes (k * 128 bytes)
     for b in &bboxes {
         let b_u8: &[u8] = unsafe {
-            std::slice::from_raw_parts(b.as_ptr() as *const u8, 64)
+            std::slice::from_raw_parts(b.as_ptr() as *const u8, 128)
         };
         writer.write_all(b_u8).unwrap();
     }
 
     // Offsets (k * 4 bytes)
-    let mut current_offset = 64 + k * 64 + k * 64 + k * 4 + k * 4;
+    let mut current_offset = 64 + k * 64 + k * 128 + k * 4 + k * 4;
     let mut offsets = vec![0u32; k];
     for ki in 0..k {
         offsets[ki] = current_offset as u32;
-        let num_blocks = (clusters[ki].len() + 7) / 8;
-        current_offset += num_blocks * 256; // 112 i16 dims + 8 padding i16 + 8 u32 meta = 224 + 32 bytes
+        current_offset += clusters[ki].len() * 64; // Each entry is 64 bytes
     }
     let offsets_u8: &[u8] = unsafe {
         std::slice::from_raw_parts(offsets.as_ptr() as *const u8, k * 4)
@@ -209,43 +205,17 @@ fn main() {
     };
     writer.write_all(sizes_u8).unwrap();
 
-    // Data (Blocks of 8)
+    // Data
     for ki in 0..k {
         let cluster_entries = &clusters[ki];
-        let num_blocks = (cluster_entries.len() + 7) / 8;
-        for bi in 0..num_blocks {
-            let mut block_dims = [0i16; 128]; // 14 dims * 8 vectors = 112. Padded to 128 for alignment.
-            let mut block_meta = [0u32; 8];
-            
-            for i in 0..8 {
-                let idx = bi * 8 + i;
-                if idx < cluster_entries.len() {
-                    let e = cluster_entries[idx];
-                    for d in 0..14 {
-                        block_dims[d * 8 + i] = e.v_i16[d];
-                    }
-                    block_meta[i] = e.meta;
-                } else {
-                    // Padding: meta index 0x7FFFFFFF is a sentinel, distance will be large
-                    block_meta[i] = 0x7FFFFFFF; 
-                    for d in 0..14 {
-                        block_dims[d * 8 + i] = 32767; // Max i16 to push distance away
-                    }
-                }
-            }
-            
+        for e in cluster_entries {
             let dims_u8: &[u8] = unsafe {
-                std::slice::from_raw_parts(block_dims.as_ptr() as *const u8, 256 - 32)
+                std::slice::from_raw_parts(e.v_f32.as_ptr() as *const u8, 64)
             };
             writer.write_all(dims_u8).unwrap();
-            
-            let meta_u8: &[u8] = unsafe {
-                std::slice::from_raw_parts(block_meta.as_ptr() as *const u8, 32)
-            };
-            writer.write_all(meta_u8).unwrap();
         }
     }
 
     writer.flush().unwrap();
-    println!("Done! dataset.bin generated successfully with SoA blocks.");
+    println!("Done! dataset.bin generated successfully with AoS [f32; 16] blocks.");
 }

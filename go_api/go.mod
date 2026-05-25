@@ -1,8 +1,5 @@
-module rinha-go
+module rinha-api
 
-go 1.22.0
+go 1.22
 
-require (
-	github.com/buger/jsonparser v1.1.1
-	golang.org/x/sys v0.17.0
-)
+require golang.org/x/sys v0.20.0
