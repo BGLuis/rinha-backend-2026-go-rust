@@ -34,7 +34,6 @@ services:
       - api2
     networks:
       - rinha-net
-    privileged: true
     ulimits:
       nofile:
         soft: 65535
@@ -61,28 +60,6 @@ services:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOMEMLIMIT=130MiB
       - GOGC=1000
-
-  warmup:
-    image: curlimages/curl:8.8.0
-    platform: linux/amd64
-    entrypoint: ["/bin/sh", "/warmup.sh"]
-    environment:
-      - BASE_URL=http://lb:9999
-      - READY_RETRIES=240
-      - READY_SLEEP=0.25
-      - WARMUP_ROUNDS=96
-    volumes:
-      - ./scripts/warmup.sh:/warmup.sh:ro
-    depends_on:
-      - lb
-    networks:
-      - rinha-net
-    deploy:
-      resources:
-        limits:
-          cpus: "0.04"
-          memory: "10M"
-    restart: "no"
 
 volumes:
   shared_sockets:
