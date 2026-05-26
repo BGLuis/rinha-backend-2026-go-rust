@@ -61,6 +61,27 @@ services:
       - GOMEMLIMIT=130MiB
       - GOGC=1000
 
+  warmup:
+    image: grafana/k6:latest
+    entrypoint: ["/bin/sh", "/warmup.sh"]
+    environment:
+      - BASE_URL=http://lb:9999
+      - READY_RETRIES=240
+      - READY_SLEEP=0.25
+    volumes:
+      - ./scripts/warmup.sh:/warmup.sh:ro
+      - ./test:/test:ro
+    depends_on:
+      - lb
+    networks:
+      - rinha-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "50M"
+    restart: "no"
+
 volumes:
   shared_sockets:
     driver: local

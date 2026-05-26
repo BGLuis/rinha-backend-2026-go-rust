@@ -22,7 +22,7 @@ restart-clean:
 	$(DOCKER_COMPOSE) down
 	$(DOCKER_COMPOSE) up -d --build
 	@echo "Waiting for stack and warmup to complete..."
-	sh scripts/warmup.sh
+	$(DOCKER_COMPOSE) logs -f warmup
 	@echo "Stack is ready."
 
 logs:
