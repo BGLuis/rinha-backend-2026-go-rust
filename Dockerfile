@@ -16,25 +16,14 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     fi && \
     cargo build --release && rm -rf src
 
-# --- Estágio Builder Rust: Compilação da Lib ---
+# --- Estágio Builder Rust: Geração do Index e Compilação da Lib ---
 FROM rust-env AS rust-builder
 ARG TARGETARCH
-COPY rust_engine/src ./src
-# Força o rebuild apenas do código da aplicação
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-    export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
-    else \
-    export RUSTFLAGS="-C link-arg=-s"; \
-    fi && \
-    touch src/lib.rs && cargo build --release
-
-# --- Estágio Dataset: Geração do Index (v2) ---
-FROM rust-env AS dataset-builder
-ARG TARGETARCH
-# Mantemos o WORKDIR em /build/rust_engine onde o Cargo.toml já existe
+# Copia resources para a geração do binário
 COPY resources/ ./resources/
 COPY rust_engine/src ./src
-# Gera o dataset.bin.
+
+# 1. Gera o dataset.bin primeiro
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
     export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
     else \
@@ -42,22 +31,53 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     fi && \
     touch src/bin/build_index.rs && cargo run --release --bin build_index && ls -lh dataset.bin
 
-# --- Estágio Builder Go: API com CGO ---
+# 2. Compila a Lib (agora com acesso ao dataset.bin via include_bytes!)
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+    export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
+    else \
+    export RUSTFLAGS="-C link-arg=-s"; \
+    fi && \
+    touch src/lib.rs && cargo build --release
+
+# --- Estágio PGO: Coleta de perfil para Profile-Guided Optimization ---
+FROM golang:1.24-bookworm AS pgo-collector
+WORKDIR /app
+
+# Copia código Go e dependências
+COPY go_api/go.mod ./
+COPY go_api/cmd ./cmd
+
+# Resolve dependências do profiler
+RUN go mod tidy && go mod download
+
+# Copia lib estática do Rust
+COPY --from=rust-builder /build/rust_engine/target/release/librust_engine.a /usr/local/lib/
+
+# Compila e roda o profiler para coletar cpu.pprof
+RUN CGO_ENABLED=1 GOOS=linux go build -o profiler ./cmd/profiler/ && \
+    ./profiler && \
+    ls -lh cpu.pprof
+
+# --- Estágio Builder Go: API com CGO + PGO ---
 FROM golang:1.24-bookworm AS go-builder
 WORKDIR /app
 
 # Copia arquivos do Go API
 COPY go_api/go.mod ./
 COPY go_api/main.go .
+COPY go_api/engine ./engine
 
 # Resolve e baixa dependências baseadas no código
 RUN go mod tidy && go mod download
 
-# Copia lib estática do Rust
+# Copia lib estática do Rust (que agora CONTÉM o dataset embutido)
 COPY --from=rust-builder /build/rust_engine/target/release/librust_engine.a /usr/local/lib/
 
-# Compilação Go vinculando a lib Rust via CGO
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o rinha-api main.go
+# Copia o perfil PGO coletado
+COPY --from=pgo-collector /app/cpu.pprof ./default.pgo
+
+# Compilação Go vinculando a lib Rust via CGO, com PGO ativado
+RUN CGO_ENABLED=1 GOOS=linux go build -pgo=default.pgo -ldflags="-s -w" -o rinha-api .
 
 # --- Estágio Final: Imagem de Produção Enxuta ---
 FROM debian:bookworm-slim
@@ -65,13 +85,11 @@ WORKDIR /app
 
 # Artefatos finais
 COPY --from=go-builder /app/rinha-api .
-# O dataset.bin foi gerado no WORKDIR do dataset-builder (/build/rust_engine)
-COPY --from=dataset-builder /build/rust_engine/dataset.bin .
+# O arquivo dataset.bin NÃO é mais copiado para a imagem final!
 COPY resources/normalization.json ./resources/
 COPY resources/mcc_risk.json ./resources/
 
 # Configurações de runtime
-ENV DATASET_PATH=/app/dataset.bin
 ENV GOMAXPROCS=1
 
 CMD ["./rinha-api"]

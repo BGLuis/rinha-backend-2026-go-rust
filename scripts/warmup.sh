@@ -10,7 +10,7 @@ echo "warming up stack via ${BASE_URL}"
 
 i=1
 while [ "${i}" -le "${READY_RETRIES}" ]; do
-  if curl -fsS --max-time 1 "${READY_URL}" >/dev/null; then
+  if wget --spider -q -T 1 "${READY_URL}"; then
     break
   fi
   if [ "${i}" -eq "${READY_RETRIES}" ]; then
@@ -22,6 +22,6 @@ while [ "${i}" -le "${READY_RETRIES}" ]; do
 done
 
 # Run the diverse k6 warmup script!
-docker run --rm --network host -v "$(pwd)/test:/test" grafana/k6 run /test/warmup.js
+k6 run /test/warmup.js
 
 echo "warmup complete"

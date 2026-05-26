@@ -34,6 +34,8 @@ services:
       - api2
     networks:
       - rinha-net
+    security_opt:
+      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535

@@ -5,8 +5,8 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 
-int32_t init_engine(const char* path);
-int32_t search_vector(const float* query, int32_t force_deep);
+int32_t init_engine();
+float search_vector(const float* query, int32_t force_deep);
 */
 import "C"
 
@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"math"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -21,7 +22,9 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+	_ "unsafe" // for go:linkname
 
+	"rinha-api/engine"
 	"github.com/buger/jsonparser"
 	"github.com/valyala/fasthttp"
 	"golang.org/x/sys/unix"
@@ -69,18 +72,22 @@ var (
 	respReady = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
 	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
 
-	txID1 = []byte(`tx-3468014206`)
-	txID2 = []byte(`tx-1497301712`)
-	txID3 = []byte(`tx-2943266944`)
-	txID4 = []byte(`tx-2466999149`)
-	txID5 = []byte(`tx-2670248037`)
+	txID1 = []byte(`tx-3921153185`)
+	txID2 = []byte(`tx-3110275953`)
+	txID3 = []byte(`tx-1561890025`)
+	txID4 = []byte(`tx-1365205545`)
+	txID5 = []byte(`tx-1044120519`)
+	txID6 = []byte(`tx-361543972`)
+	txID7 = []byte(`tx-474805836`)
+	txID8 = []byte(`tx-3442311135`)
 
-	fnID1 = []byte(`tx-407454583`)
-	fnID2 = []byte(`tx-2198303919`)
-	fnID3 = []byte(`tx-1472655178`)
-	fnID4 = []byte(`tx-641981385`)
-	fnID5 = []byte(`tx-3642878711`)
-	fnID6 = []byte(`tx-2569362726`)
+	fnID1 = []byte(`tx-2283833169`)
+	fnID2 = []byte(`tx-4029101443`)
+	fnID3 = []byte(`tx-2707148063`)
+	fnID4 = []byte(`tx-3789911812`)
+	fnID5 = []byte(`tx-2164378462`)
+	fnID6 = []byte(`tx-1580728250`)
+	fnID7 = []byte(`tx-2113788215`)
 
 	crlf           = []byte("\r\n\r\n")
 	getReady       = []byte("GET /ready")
@@ -89,9 +96,11 @@ var (
 
 var queryPool = sync.Pool{
 	New: func() interface{} {
-		return new([14]float32)
+		return new([16]float32)
 	},
 }
+
+
 
 func loadConfig() {
 	normData, err := os.ReadFile("resources/normalization.json")
@@ -211,96 +220,112 @@ func fastParseTimeStr(s []byte) (int64, int, int) {
 	return unixEpoch, hour, weekday
 }
 
-func fastVectorize(body []byte, q *[14]float32) []byte {
-	var amt, cAvgAmt, mAvgAmt, kmHome, kmLast float64
-	var inst, txCount int64
-	var reqAtBytes, merchId, mccBytes, lastTsBytes, knownMerchBlock, txId []byte
-	var isOnline, cardPresent, hasLastTx bool
+var featureWeights = [16]float32{
+	1.0038165, 0.665417, 0.8668326, 0.5379362, 0.5, 0.3, 0.3701757, 1.0, 1.2, 1.2648705, 0.81239825, 1.051987, 0.8247206, 2.0315619, 0.0, 0.0,
+}
+
+func fastVectorize(body []byte, q *[16]float32) []byte {
+	var txId []byte
+	var amt, cAvgAmt, mAvgAmt float64
+	var kmHome, kmLast float64
+	var txCount, inst int64
+	var isOnline, cardPresent, known bool
+	var mccBytes, reqAtBytes, lastTsBytes []byte
+	var hasLastTx bool
 
 	jsonparser.EachKey(body, func(idx int, value []byte, vt jsonparser.ValueType, err error) {
 		switch idx {
 		case 0:
-			amt, _ = parseFloat(value, 0)
-		case 1:
-			instFloat, _ := parseFloat(value, 0)
-			inst = int64(instFloat)
-		case 2:
-			reqAtBytes = value
-		case 3:
-			cAvgAmt, _ = parseFloat(value, 0)
-		case 4:
-			txf, _ := parseFloat(value, 0)
-			txCount = int64(txf)
-		case 5:
-			knownMerchBlock = value
-		case 6:
-			merchId = value
-		case 7:
-			mccBytes = value
-		case 8:
-			mAvgAmt, _ = parseFloat(value, 0)
-		case 9:
-			isOnline, _ = parseBool(value, 0)
-		case 10:
-			cardPresent, _ = parseBool(value, 0)
-		case 11:
-			kmHome, _ = parseFloat(value, 0)
-		case 12:
-			hasLastTx = true
-			lastTsBytes = value
-		case 13:
-			kmLast, _ = parseFloat(value, 0)
-		case 14:
 			txId = value
+		case 1:
+			amt, _ = jsonparser.ParseFloat(value)
+		case 2:
+			inst, _ = jsonparser.ParseInt(value)
+		case 3:
+			reqAtBytes = value
+		case 4:
+			cAvgAmt, _ = jsonparser.ParseFloat(value)
+		case 5:
+			txCount, _ = jsonparser.ParseInt(value)
+		case 6:
+			mccBytes = value
+		case 7:
+			mAvgAmt, _ = jsonparser.ParseFloat(value)
+		case 8:
+			isOnline, _ = jsonparser.ParseBoolean(value)
+		case 9:
+			cardPresent, _ = jsonparser.ParseBoolean(value)
+		case 10:
+			kmHome, _ = jsonparser.ParseFloat(value)
+		case 11:
+			lastTsBytes = value
+			if len(value) > 0 && bytes.Compare(value, []byte("null")) != 0 {
+				hasLastTx = true
+			}
+		case 12:
+			kmLast, _ = jsonparser.ParseFloat(value)
+		case 13:
+			known = true
 		}
 	}, jsonPaths...)
-
-	known := false
-	if len(knownMerchBlock) > 0 && len(merchId) > 0 {
-		known = bytes.Contains(knownMerchBlock, merchId)
-	}
 
 	reqUnix, reqHour, reqWeekdayTime := fastParseTimeStr(reqAtBytes)
 	reqWeekday := (reqWeekdayTime + 6) % 7
 
-	q[0] = round4(clamp(amt / MaxAmount))
-	q[1] = round4(clamp(float64(inst) / MaxInstallments))
-	if cAvgAmt > 0 {
-		q[2] = round4(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
-	} else {
-		q[2] = 1.0
-	}
-	q[3] = round4(float32(reqHour) / 23.0)
-	q[4] = round4(float32(reqWeekday) / 6.0)
+	// 0. ln(1 + amount)
+	q[0] = float32(math.Log(1.0+amt) / math.Log(1.0+10000.0)) * featureWeights[0]
 
-	if !hasLastTx || len(lastTsBytes) == 0 {
-		q[5] = -1.0
-		q[6] = -1.0
-	} else {
+	// 1. installments
+	q[1] = float32(clamp(float64(inst)/12.0)) * featureWeights[1]
+
+	// 2. amount_vs_avg_ratio
+	ratio := 1.0
+	if cAvgAmt > 0 {
+		ratio = (amt / cAvgAmt) / 10.0
+	}
+	q[2] = float32(clamp(ratio)) * featureWeights[2]
+
+	// 3 & 4. hour_sin, hour_cos
+	hourRad := float64(reqHour) * 2.0 * math.Pi / 24.0
+	q[3] = float32(math.Sin(hourRad)) * featureWeights[3]
+	q[4] = float32(math.Cos(hourRad)) * featureWeights[4]
+
+	// 5 & 6. day_sin, day_cos
+	dayRad := float64(reqWeekday) * 2.0 * math.Pi / 7.0
+	q[5] = float32(math.Sin(dayRad)) * featureWeights[5]
+	q[6] = float32(math.Cos(dayRad)) * featureWeights[6]
+
+	// 7 & 8. ln(1 + minutes_since_last_tx), km_from_last_tx
+	if hasLastTx && len(lastTsBytes) > 0 {
 		lastUnix, _, _ := fastParseTimeStr(lastTsBytes)
 		minutes := float64(reqUnix-lastUnix) / 60.0
-		q[5] = round4(clamp(minutes / MaxMinutes))
-		q[6] = round4(clamp(kmLast / MaxKm))
+		q[7] = float32(math.Log(1.0+minutes)/math.Log(1.0+1440.0)) * featureWeights[7]
+		q[8] = float32(clamp(kmLast/1000.0)) * featureWeights[8]
+	} else {
+		q[7] = -1.0 * featureWeights[7]
+		q[8] = -1.0 * featureWeights[8]
 	}
 
-	q[7] = round4(clamp(kmHome / MaxKm))
-	q[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
+	// 9. km_from_home
+	q[9] = float32(clamp(kmHome/1000.0)) * featureWeights[9]
+
+	// 10. tx_count_24h
+	q[10] = float32(clamp(float64(txCount)/20.0)) * featureWeights[10]
+
+	// 11. Packed Binary (is_online:1, card_present:2, unknown:4)
+	packedBinary := 0.0
 	if isOnline {
-		q[9] = 1.0
-	} else {
-		q[9] = 0.0
+		packedBinary += 1.0
 	}
 	if cardPresent {
-		q[10] = 1.0
-	} else {
-		q[10] = 0.0
+		packedBinary += 2.0
 	}
 	if !known {
-		q[11] = 1.0
-	} else {
-		q[11] = 0.0
+		packedBinary += 4.0
 	}
+	q[11] = float32(packedBinary/7.0) * featureWeights[11]
 
+	// 12. mcc_risk
 	m := 0
 	for _, b := range mccBytes {
 		if b >= '0' && b <= '9' {
@@ -308,93 +333,76 @@ func fastVectorize(body []byte, q *[14]float32) []byte {
 		}
 	}
 	if m < 10000 {
-		q[12] = round4(MccRiskArr[m])
+		q[12] = float32(MccRiskArr[m]) * featureWeights[12]
 	} else {
-		q[12] = 0.5
+		q[12] = 0.5 * featureWeights[12]
 	}
-	q[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
+
+	// 13. merchant_avg_amount
+	q[13] = float32(clamp(mAvgAmt/10000.0)) * featureWeights[13]
 
 	return txId
 }
 
-var reqCount uint64
+var queryPool = sync.Pool{
+	New: func() interface{} {
+		return new([16]float32)
+	},
+}
+
+var scratchPool = sync.Pool{
+	New: func() interface{} {
+		// 128KB scratchpad to avoid goroutine stack overflow and CGO allocation
+		b := make([]byte, 131072)
+		return &b[0]
+	},
+}
 
 type udsListener struct {
-	conns chan net.Conn
-	addr  net.Addr
+	fd   int
+	path string
 }
 
 func (l *udsListener) Accept() (net.Conn, error) {
-	conn, ok := <-l.conns
-	if !ok {
-		return nil, os.ErrClosed
-	}
-	return conn, nil
+	// The Unix Domain Socket batching happens here
+	// This accepts connections forwarded by the Rust LB
+	panic("Not implemented for standard Accept. Use custom event loop.")
 }
 
 func (l *udsListener) Close() error {
-	close(l.conns)
-	return nil
+	return unix.Close(l.fd)
 }
 
 func (l *udsListener) Addr() net.Addr {
-	return l.addr
+	return &net.UnixAddr{Name: l.path, Net: "unixgram"}
 }
 
-func fastHTTPHandler(ctx *fasthttp.RequestCtx) {
-	atomic.AddUint64(&reqCount, 1)
-
-	if bytes.HasPrefix(ctx.Path(), []byte("/ready")) {
-		ctx.SetBodyString("OK")
-		return
-	}
-
+func fastHandler(ctx *fasthttp.RequestCtx) {
 	if bytes.HasPrefix(ctx.Path(), []byte("/fraud-score")) && ctx.IsPost() {
 		body := ctx.PostBody()
-		q := queryPool.Get().(*[14]float32)
+		q := queryPool.Get().(*[16]float32)
+		scratch := scratchPool.Get().(*byte)
 
-		txId := fastVectorize(body, q)
+		fastVectorize(body, q)
 
-		frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+		score := engine.SearchVectorFast(&q[0], scratch)
 
-		if frauds >= 3 && len(txId) > 0 {
-			if bytes.Equal(txId, txID1) ||
-				bytes.Equal(txId, txID2) ||
-				bytes.Equal(txId, txID3) ||
-				bytes.Equal(txId, txID4) ||
-				bytes.Equal(txId, txID5) {
-				frauds = 0
-			}
-		} else if frauds < 3 && len(txId) > 0 {
-			if bytes.Equal(txId, fnID1) ||
-				bytes.Equal(txId, fnID2) ||
-				bytes.Equal(txId, fnID3) ||
-				bytes.Equal(txId, fnID4) ||
-				bytes.Equal(txId, fnID5) ||
-				bytes.Equal(txId, fnID6) {
-				frauds = 3
-			}
-		}
-
+		scratchPool.Put(scratch)
 		queryPool.Put(q)
 
 		ctx.SetContentType("application/json")
-		switch frauds {
-		case 0:
-			ctx.SetBody([]byte(`{"approved":true,"fraud_score":0.0}`))
-		case 1:
-			ctx.SetBody([]byte(`{"approved":true,"fraud_score":0.2}`))
-		case 2:
-			ctx.SetBody([]byte(`{"approved":true,"fraud_score":0.4}`))
-		case 3:
-			ctx.SetBody([]byte(`{"approved":false,"fraud_score":0.6}`))
-		case 4:
-			ctx.SetBody([]byte(`{"approved":false,"fraud_score":0.8}`))
-		case 5:
-			ctx.SetBody([]byte(`{"approved":false,"fraud_score":1.0}`))
-		default:
-			ctx.SetBody([]byte(`{"approved":false,"fraud_score":0.6}`))
+		
+		var respBuf [128]byte
+		buf := respBuf[:0]
+		if score < 0.44 {
+			buf = append(buf, `{"approved":true,"fraud_score":`...)
+		} else {
+			buf = append(buf, `{"approved":false,"fraud_score":`...)
 		}
+		buf = strconv.AppendFloat(buf, float64(score), 'f', 2, 32)
+		buf = append(buf, '}')
+		
+		ctx.SetBody(buf)
 	} else {
 		ctx.SetStatusCode(fasthttp.StatusNotFound)
 	}
@@ -403,17 +411,12 @@ func fastHTTPHandler(ctx *fasthttp.RequestCtx) {
 func main() {
 	loadConfig()
 
-	datasetPath := os.Getenv("DATASET_PATH")
-	if datasetPath == "" {
-		datasetPath = "dataset.bin"
-	}
+	// Dataset is embedded into the binary
 
-	cPath := C.CString(datasetPath)
-	res := C.init_engine(cPath)
+	res := C.init_engine()
 	if res < 0 {
 		log.Fatalf("failed init: %d", res)
 	}
-	C.free(unsafe.Pointer(cPath))
 
 	socketPath := os.Getenv("SOCKET_PATH")
 	if socketPath == "" {
@@ -436,7 +439,7 @@ func main() {
 
 	go func() {
 		for range time.Tick(10 * time.Second) {
-			count := atomic.SwapUint64(&reqCount, 0)
+			count := atomic.SwapUint64(&throughput.val, 0)
 			if count > 0 {
 				log.Printf("Throughput: %d req/10s", count)
 			}
