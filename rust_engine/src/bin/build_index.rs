@@ -11,15 +11,20 @@ struct RawEntry {
     label: String,
 }
 
+#[derive(Clone, Copy)]
 struct Entry {
     v_f32: [f32; 16],
+    v_i16: [i16; 16],
+}
+
+fn quantize(f: f32) -> i16 {
+    (f * 10000.0).round() as i16
 }
 
 fn main() {
     let references_path = "resources/references.json.gz";
     let example_path = "resources/example-references.json";
     
-    // Check if references_path is an LFS pointer
     let is_lfs = {
         let f = File::open(references_path).expect("Failed to open references.json.gz");
         let mut buf = [0u8; 100];
@@ -30,46 +35,36 @@ fn main() {
     };
 
     let raw_entries: Vec<RawEntry> = if is_lfs {
-        println!("references.json.gz is an LFS pointer. Falling back to {}...", example_path);
-        let file = File::open(example_path).expect("Failed to open example-references.json");
-        let reader = BufReader::new(file);
-        serde_json::from_reader(reader).expect("Failed to parse example JSON")
+        let file = File::open(example_path).expect("Failed to open example");
+        serde_json::from_reader(BufReader::new(file)).expect("Failed to parse")
     } else {
-        println!("Loading {}...", references_path);
-        let file = File::open(references_path).expect("Failed to open references.json.gz");
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
-        serde_json::from_reader(reader).expect("Failed to parse gzipped JSON")
+        let file = File::open(references_path).expect("Failed to open gz");
+        serde_json::from_reader(BufReader::new(GzDecoder::new(file))).expect("Failed to parse")
     };
-
-    println!("Loaded {} entries", raw_entries.len());
 
     let entries: Vec<Entry> = raw_entries.into_par_iter().enumerate().map(|(i, e)| {
         let mut v_f32 = [0.0f32; 16];
+        let mut v_i16 = [0i16; 16];
         for d in 0..14 {
             v_f32[d] = e.vector[d];
+            v_i16[d] = quantize(e.vector[d]);
         }
         let label_bit = if e.label == "fraud" { 1u32 } else { 0u32 };
         let meta = (label_bit << 31) | (i as u32 & 0x7FFFFFFF);
+        
+        v_i16[14] = (meta & 0xFFFF) as i16;
+        v_i16[15] = ((meta >> 16) & 0xFFFF) as i16;
         v_f32[15] = f32::from_bits(meta);
-        Entry { v_f32 }
+
+        Entry { v_f32, v_i16 }
     }).collect();
 
     let k = 4096;
-    println!("Clustering into {} clusters...", k);
-    
-    // Simple K-Means
     let mut rng = rand::thread_rng();
-    let mut centroids: Vec<[f32; 16]> = entries.choose_multiple(&mut rng, k)
-        .map(|e| e.v_f32)
-        .collect();
+    let mut centroids: Vec<[f32; 16]> = entries.choose_multiple(&mut rng, k).map(|e| e.v_f32).collect();
+    while centroids.len() < k { centroids.push([0.0f32; 16]); }
 
-    // Ensure we have exactly k centroids
-    while centroids.len() < k {
-        centroids.push([0.0f32; 16]);
-    }
-
-    for iter in 0..10 {
+    for _iter in 0..10 {
         let next_centroids: Vec<([f64; 16], usize)> = entries.par_iter()
             .fold(|| vec![([0.0f64; 16], 0usize); k], |mut acc, e| {
                 let mut best_d2 = f32::MAX;
@@ -80,22 +75,14 @@ fn main() {
                         let diff = e.v_f32[d] - c[d];
                         d2 += diff * diff;
                     }
-                    if d2 < best_d2 {
-                        best_d2 = d2;
-                        best_ki = ki;
-                    }
+                    if d2 < best_d2 { best_d2 = d2; best_ki = ki; }
                 }
-                for d in 0..14 {
-                    acc[best_ki].0[d] += e.v_f32[d] as f64;
-                }
+                for d in 0..14 { acc[best_ki].0[d] += e.v_f32[d] as f64; }
                 acc[best_ki].1 += 1;
                 acc
-            })
-            .reduce(|| vec![([0.0f64; 16], 0usize); k], |mut a, b| {
+            }).reduce(|| vec![([0.0f64; 16], 0usize); k], |mut a, b| {
                 for i in 0..k {
-                    for d in 0..14 {
-                        a[i].0[d] += b[i].0[d];
-                    }
+                    for d in 0..14 { a[i].0[d] += b[i].0[d]; }
                     a[i].1 += b[i].1;
                 }
                 a
@@ -108,114 +95,105 @@ fn main() {
                 }
             }
         }
-        println!("Iteration {} complete", iter + 1);
     }
 
-    println!("Assigning points to clusters and calculating BBoxes...");
-    let mut clusters: Vec<Vec<&Entry>> = vec![Vec::new(); k];
+    let mut centroids_i16 = vec![[0i16; 16]; k];
+    for ki in 0..k {
+        for d in 0..14 { centroids_i16[ki][d] = quantize(centroids[ki][d]); }
+    }
+
+    let mut clusters: Vec<Vec<Entry>> = vec![Vec::new(); k];
     let mut assignments: Vec<usize> = vec![0; entries.len()];
     
     assignments.par_iter_mut().enumerate().for_each(|(i, ki)| {
         let e = &entries[i];
-        let mut best_d2 = f32::MAX;
+        let mut best_d2 = i32::MAX;
         let mut best_ki = 0;
-        for (j, c) in centroids.iter().enumerate() {
-            let mut d2 = 0.0f32;
+        for (j, c) in centroids_i16.iter().enumerate() {
+            let mut d2 = 0i32;
             for d in 0..14 {
-                let diff = e.v_f32[d] - c[d];
+                let diff = (e.v_i16[d] as i32) - (c[d] as i32);
                 d2 += diff * diff;
             }
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best_ki = j;
-            }
+            if d2 < best_d2 { best_d2 = d2; best_ki = j; }
         }
         *ki = best_ki;
     });
 
     for (i, &ki) in assignments.iter().enumerate() {
-        clusters[ki].push(&entries[i]);
+        clusters[ki].push(entries[i]);
     }
 
-    let mut bboxes = vec![[0f32; 32]; k];
+    let mut bboxes_i16 = vec![[0i16; 32]; k];
     for ki in 0..k {
-        let mut mins = [f32::MAX; 16];
-        let mut maxs = [f32::MIN; 16];
+        let mut mins = [i16::MAX; 16];
+        let mut maxs = [i16::MIN; 16];
         for e in &clusters[ki] {
             for d in 0..14 {
-                if e.v_f32[d] < mins[d] { mins[d] = e.v_f32[d]; }
-                if e.v_f32[d] > maxs[d] { maxs[d] = e.v_f32[d]; }
+                if e.v_i16[d] < mins[d] { mins[d] = e.v_i16[d]; }
+                if e.v_i16[d] > maxs[d] { maxs[d] = e.v_i16[d]; }
             }
         }
-        bboxes[ki][0..16].copy_from_slice(&mins);
-        bboxes[ki][16..32].copy_from_slice(&maxs);
+        bboxes_i16[ki][0..16].copy_from_slice(&mins);
+        bboxes_i16[ki][16..32].copy_from_slice(&maxs);
     }
 
-    println!("Writing dataset.bin to {}...", std::env::current_dir().unwrap().display());
     let out_file = File::create("dataset.bin").expect("Failed to create dataset.bin");
     let mut writer = BufWriter::new(out_file);
 
-    // Header (64 bytes)
     let mut header = [0u32; 16];
-    header[0] = 0x4E495452; // "NITR"
-    header[1] = 3; // version 3 (AoS layout f32)
+    header[0] = 0x4E495452; 
+    header[1] = 5; // version 5 (Hierarchical)
     header[2] = k as u32;
     header[3] = entries.len() as u32;
     
-    let header_u8: &[u8] = unsafe {
-        std::slice::from_raw_parts(header.as_ptr() as *const u8, 64)
-    };
-    writer.write_all(header_u8).unwrap();
+    writer.write_all(unsafe { std::slice::from_raw_parts(header.as_ptr() as *const u8, 64) }).unwrap();
+    writer.write_all(unsafe { std::slice::from_raw_parts(centroids_i16.as_ptr() as *const u8, k * 32) }).unwrap();
+    writer.write_all(unsafe { std::slice::from_raw_parts(bboxes_i16.as_ptr() as *const u8, k * 64) }).unwrap();
 
-    // Centroids (k * 64 bytes)
-    for c in &centroids {
-        let c_u8: &[u8] = unsafe {
-            std::slice::from_raw_parts(c.as_ptr() as *const u8, 64)
-        };
-        writer.write_all(c_u8).unwrap();
-    }
-
-    // BBoxes (k * 128 bytes)
-    for b in &bboxes {
-        let b_u8: &[u8] = unsafe {
-            std::slice::from_raw_parts(b.as_ptr() as *const u8, 128)
-        };
-        writer.write_all(b_u8).unwrap();
-    }
-
-    // Offsets (k * 4 bytes)
-    let mut current_offset = 64 + k * 64 + k * 128 + k * 4 + k * 4;
+    let mut current_offset = 64 + k * 32 + k * 64 + k * 4 + k * 4;
     let mut offsets = vec![0u32; k];
+    let mut num_blocks = vec![0u32; k];
+    
+    let mut cluster_data_bytes = Vec::new();
+    
     for ki in 0..k {
         offsets[ki] = current_offset as u32;
-        current_offset += clusters[ki].len() * 64; // Each entry is 64 bytes
-    }
-    let offsets_u8: &[u8] = unsafe {
-        std::slice::from_raw_parts(offsets.as_ptr() as *const u8, k * 4)
-    };
-    writer.write_all(offsets_u8).unwrap();
-
-    // Sizes (k * 4 bytes)
-    let mut sizes = vec![0u32; k];
-    for ki in 0..k {
-        sizes[ki] = clusters[ki].len() as u32;
-    }
-    let sizes_u8: &[u8] = unsafe {
-        std::slice::from_raw_parts(sizes.as_ptr() as *const u8, k * 4)
-    };
-    writer.write_all(sizes_u8).unwrap();
-
-    // Data
-    for ki in 0..k {
-        let cluster_entries = &clusters[ki];
-        for e in cluster_entries {
-            let dims_u8: &[u8] = unsafe {
-                std::slice::from_raw_parts(e.v_f32.as_ptr() as *const u8, 64)
-            };
-            writer.write_all(dims_u8).unwrap();
+        let mut blocks = 0;
+        
+        for chunk in clusters[ki].chunks(256) {
+            blocks += 1;
+            let mut mins = [i16::MAX; 16];
+            let mut maxs = [i16::MIN; 16];
+            for e in chunk {
+                for d in 0..14 {
+                    if e.v_i16[d] < mins[d] { mins[d] = e.v_i16[d]; }
+                    if e.v_i16[d] > maxs[d] { maxs[d] = e.v_i16[d]; }
+                }
+            }
+            
+            let mut block_header = [0u32; 24]; // 96 bytes total
+            unsafe {
+                let bbox_slice = std::slice::from_raw_parts_mut(block_header.as_mut_ptr() as *mut i16, 32);
+                bbox_slice[0..16].copy_from_slice(&mins);
+                bbox_slice[16..32].copy_from_slice(&maxs);
+            }
+            block_header[16] = chunk.len() as u32;
+            
+            cluster_data_bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(block_header.as_ptr() as *const u8, 96) });
+            current_offset += 96;
+            
+            for e in chunk {
+                cluster_data_bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(e.v_i16.as_ptr() as *const u8, 32) });
+                current_offset += 32;
+            }
         }
+        num_blocks[ki] = blocks as u32;
     }
+
+    writer.write_all(unsafe { std::slice::from_raw_parts(offsets.as_ptr() as *const u8, k * 4) }).unwrap();
+    writer.write_all(unsafe { std::slice::from_raw_parts(num_blocks.as_ptr() as *const u8, k * 4) }).unwrap();
+    writer.write_all(&cluster_data_bytes).unwrap();
 
     writer.flush().unwrap();
-    println!("Done! dataset.bin generated successfully with AoS [f32; 16] blocks.");
 }

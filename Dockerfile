@@ -43,7 +43,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     touch src/bin/build_index.rs && cargo run --release --bin build_index && ls -lh dataset.bin
 
 # --- Estágio Builder Go: API com CGO ---
-FROM golang:1.22-bookworm AS go-builder
+FROM golang:1.24-bookworm AS go-builder
 WORKDIR /app
 
 # Copia arquivos do Go API
