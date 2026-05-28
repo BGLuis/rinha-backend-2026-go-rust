@@ -3,8 +3,10 @@ package main
 /*
 #cgo LDFLAGS: -L/usr/local/lib -lrust_engine -lm -ldl
 #include <stdint.h>
-int32_t init_engine();
-float search_vector(const float* query, int32_t force_deep);
+#include <stdlib.h>
+
+int32_t init_engine(const char* path);
+int32_t search_vector(const float* query, int32_t force_deep);
 */
 import "C"
 
@@ -17,7 +19,10 @@ import (
 )
 
 func main() {
-	res := C.init_engine()
+	cPath := C.CString("dataset.bin")
+	res := C.init_engine(cPath)
+	C.free(unsafe.Pointer(cPath))
+	
 	if res < 0 {
 		log.Fatalf("init failed: %d", res)
 	}
@@ -32,11 +37,11 @@ func main() {
 	defer pprof.StopCPUProfile()
 
 	rng := rand.New(rand.NewSource(42))
-	var q [16]float32
+	var q [14]float32
 
 	// Run 50000 synthetic searches to build a representative profile
 	for i := 0; i < 50000; i++ {
-		for j := 0; j < 16; j++ {
+		for j := 0; j < 14; j++ {
 			q[j] = rng.Float32()
 		}
 		C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)

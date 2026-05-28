@@ -22,6 +22,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.lb
+    restart: always
     environment:
       - PORT=9999
       - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock
@@ -34,8 +35,6 @@ services:
       - api2
     networks:
       - rinha-net
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       nofile:
         soft: 65535
@@ -51,6 +50,7 @@ services:
 
   api1:
     <<: *api-common
+    restart: always
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOMEMLIMIT=130MiB
@@ -58,31 +58,32 @@ services:
 
   api2:
     <<: *api-common
+    restart: always
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOMEMLIMIT=130MiB
       - GOGC=1000
 
-  warmup:
-    image: grafana/k6:latest
-    entrypoint: ["/bin/sh", "/warmup.sh"]
-    environment:
-      - BASE_URL=http://lb:9999
-      - READY_RETRIES=240
-      - READY_SLEEP=0.25
-    volumes:
-      - ./scripts/warmup.sh:/warmup.sh:ro
-      - ./test:/test:ro
-    depends_on:
-      - lb
-    networks:
-      - rinha-net
-    deploy:
-      resources:
-        limits:
-          cpus: "0.10"
-          memory: "50M"
-    restart: "no"
+#   warmup:
+#     image: grafana/k6:latest
+#     entrypoint: ["/bin/sh", "/warmup.sh"]
+#     environment:
+#       - BASE_URL=http://lb:9999
+#       - READY_RETRIES=240
+#       - READY_SLEEP=0.25
+#     volumes:
+#       - ./scripts/warmup.sh:/warmup.sh:ro
+#       - ./test:/test:ro
+#     depends_on:
+#       - lb
+#     networks:
+#       - rinha-net
+#     deploy:
+#       resources:
+#         limits:
+#           cpus: "0.10"
+#           memory: "50M"
+#     restart: "no"
 
 volumes:
   shared_sockets:

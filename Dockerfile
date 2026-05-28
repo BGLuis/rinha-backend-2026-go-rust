@@ -31,7 +31,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     fi && \
     touch src/bin/build_index.rs && cargo run --release --bin build_index && ls -lh dataset.bin
 
-# 2. Compila a Lib (agora com acesso ao dataset.bin via include_bytes!)
+# 2. Compila a Lib
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
     export RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma,+f16c,+bmi2,+popcnt -C link-arg=-s"; \
     else \
@@ -52,6 +52,7 @@ RUN go mod tidy && go mod download
 
 # Copia lib estática do Rust
 COPY --from=rust-builder /build/rust_engine/target/release/librust_engine.a /usr/local/lib/
+COPY --from=rust-builder /build/rust_engine/dataset.bin ./
 
 # Compila e roda o profiler para coletar cpu.pprof
 RUN CGO_ENABLED=1 GOOS=linux go build -o profiler ./cmd/profiler/ && \
@@ -70,7 +71,7 @@ COPY go_api/engine ./engine
 # Resolve e baixa dependências baseadas no código
 RUN go mod tidy && go mod download
 
-# Copia lib estática do Rust (que agora CONTÉM o dataset embutido)
+# Copia lib estática do Rust
 COPY --from=rust-builder /build/rust_engine/target/release/librust_engine.a /usr/local/lib/
 
 # Copia o perfil PGO coletado
@@ -85,7 +86,7 @@ WORKDIR /app
 
 # Artefatos finais
 COPY --from=go-builder /app/rinha-api .
-# O arquivo dataset.bin NÃO é mais copiado para a imagem final!
+COPY --from=rust-builder /build/rust_engine/dataset.bin ./
 COPY resources/normalization.json ./resources/
 COPY resources/mcc_risk.json ./resources/
 

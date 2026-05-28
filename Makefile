@@ -21,8 +21,8 @@ restart:
 restart-clean:
 	$(DOCKER_COMPOSE) down
 	$(DOCKER_COMPOSE) up -d --build
-	@echo "Waiting for stack and warmup to complete..."
-	$(DOCKER_COMPOSE) logs -f warmup
+	@echo "Waiting for stack to start..."
+	sleep 3
 	@echo "Stack is ready."
 
 logs:
@@ -42,7 +42,9 @@ heavy-test:
 	docker-compose -f test/docker-compose.yml --profile heavy up
 
 test-precision:
-	$(MAKE) test-sustained
+	mkdir -p "$(PWD)/test"
+	touch "$(PWD)/test/results_precision.json" && chmod 666 "$(PWD)/test/results_precision.json"
+	docker-compose -f test/docker-compose.yml --profile precision up
 
 test-thermal:
 	mkdir -p "$(PWD)/test"

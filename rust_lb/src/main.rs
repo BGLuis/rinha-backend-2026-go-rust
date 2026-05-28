@@ -7,13 +7,15 @@ const DEFAULT_PORT: u16 = 9999;
 const DEFAULT_BACKLOG: i32 = 8192;
 
 fn main() -> std::io::Result<()> {
+    // Ignore SIGPIPE
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+
     let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT);
     let upstreams_env = std::env::var("UPSTREAMS").unwrap_or_else(|_| "".to_string());
     let upstreams: Vec<String> = upstreams_env.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
 
     let listen_fd = create_listener(port, DEFAULT_BACKLOG)?;
 
-    // UDS socket MUST be BLOCKING to provide backpressure and avoid dropping FDs
     let uds_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
     if uds_fd < 0 { return Err(std::io::Error::last_os_error()); }
 
@@ -34,47 +36,42 @@ fn main() -> std::io::Result<()> {
         up_addrs.push(addr);
     }
 
-    // FINE-TUNING do io_uring para máximo desempenho:
-    // 1. Sem SQPOLL: Evita roubo de cota de CPU por thread de kernel polling
-    // 2. COOP_TASKRUN: Agendamento cooperativo
-    // 3. SINGLE_ISSUER: Sem travas globais de anel (apenas 1 thread envia/recebe)
-    // 4. DEFER_TASKRUN: Posterga preempção do núcleo para submissão
-    let mut ring: io_uring::IoUring = io_uring::IoUring::builder()
-        .setup_coop_taskrun()
-        .setup_single_issuer()
-        .setup_defer_taskrun()
-        .build(4096)?;
+    // Usar epoll puro (Suportado nativamente em qualquer Docker / Linux)
+    let epfd = unsafe { libc::epoll_create1(0) };
+    if epfd < 0 { return Err(std::io::Error::last_os_error()); }
 
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: listen_fd as u64,
+    };
+    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, listen_fd, &mut ev) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
     let mut rr = 0;
 
-    let mut sq = ring.submission();
-    for _ in 0..128 {
-        let accept_e = io_uring::opcode::Accept::new(io_uring::types::Fd(listen_fd), ptr::null_mut::<libc::sockaddr>(), ptr::null_mut::<libc::socklen_t>())
-            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-            .build()
-            .user_data(1);
-        unsafe { sq.push(&accept_e).unwrap(); }
-    }
-    drop(sq);
-    ring.submit()?;
+    println!("Fallback LB started with pure epoll on port {}", port);
 
     loop {
-        match ring.submit_and_wait(1) {
-            Ok(_) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(e) => return Err(e),
+        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, -1) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
         }
-        let mut cq = ring.completion();
-        cq.sync();
 
-        let mut accepted_count = 0;
-        let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(16); up_addrs.len()];
+        let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(64); up_addrs.len()];
 
-        for cqe in cq {
-            if cqe.user_data() == 1 {
-                let res = cqe.result();
-                if res >= 0 {
-                    let client_fd = res;
+        for i in 0..n {
+            if events[i as usize].u64 == listen_fd as u64 {
+                loop {
+                    let client_fd = unsafe { libc::accept4(listen_fd, ptr::null_mut(), ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
+                    if client_fd < 0 {
+                        break;
+                    }
                     unsafe {
                         let one: libc::c_int = 1;
                         libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
@@ -84,7 +81,6 @@ fn main() -> std::io::Result<()> {
                     batches[target_idx].push(client_fd);
                     rr = rr.wrapping_add(1);
                 }
-                accepted_count += 1;
             }
         }
 
@@ -94,17 +90,6 @@ fn main() -> std::io::Result<()> {
                     send_fds(uds_fd, &up_addrs[i], chunk);
                 }
                 for &fd in batch { unsafe { libc::close(fd); } }
-            }
-        }
-
-        if accepted_count > 0 {
-            let mut sq = ring.submission();
-            for _ in 0..accepted_count {
-                let accept_e = io_uring::opcode::Accept::new(io_uring::types::Fd(listen_fd), ptr::null_mut::<libc::sockaddr>(), ptr::null_mut::<libc::socklen_t>())
-                    .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-                    .build()
-                    .user_data(1);
-                unsafe { sq.push(&accept_e).unwrap_or(()); }
             }
         }
     }
@@ -140,7 +125,7 @@ fn send_fds(sock: libc::c_int, addr: &libc::sockaddr_un, fds: &[libc::c_int]) {
 }
 
 fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
     let one: libc::c_int = 1;
     unsafe {
