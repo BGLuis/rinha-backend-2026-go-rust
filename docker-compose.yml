@@ -9,6 +9,9 @@ x-api-common: &api-common
     nofile:
       soft: 65535
       hard: 65535
+    memlock:
+      soft: -1
+      hard: -1
   deploy:
     resources:
       limits:
@@ -19,6 +22,7 @@ services:
   lb:
     image: luiis001/rinha-lb-2026:latest
     pull_policy: always
+    restart: always
     environment:
       - PORT=9999
       - UPSTREAMS=/tmp/sockets/api1.sock,/tmp/sockets/api2.sock
@@ -46,6 +50,7 @@ services:
 
   api1:
     <<: *api-common
+    restart: always
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - GOMEMLIMIT=130MiB
@@ -53,6 +58,7 @@ services:
 
   api2:
     <<: *api-common
+    restart: always
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - GOMEMLIMIT=130MiB
