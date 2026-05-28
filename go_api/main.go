@@ -5,8 +5,8 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 
-int32_t init_engine();
-float search_vector(const float* query, int32_t force_deep);
+int32_t init_engine(const char* path);
+int32_t search_vector(const float* query, int32_t force_deep);
 */
 import "C"
 
@@ -16,38 +16,16 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
-	_ "unsafe" // for go:linkname
 
-	"rinha-api/engine"
-	"github.com/buger/jsonparser"
-	"github.com/valyala/fasthttp"
 	"golang.org/x/sys/unix"
-	"net"
 )
-
-var jsonPaths = [][]string{
-	{"transaction", "amount"},
-	{"transaction", "installments"},
-	{"transaction", "requested_at"},
-	{"customer", "avg_amount"},
-	{"customer", "tx_count_24h"},
-	{"customer", "known_merchants"},
-	{"merchant", "id"},
-	{"merchant", "mcc"},
-	{"merchant", "avg_amount"},
-	{"terminal", "is_online"},
-	{"terminal", "card_present"},
-	{"terminal", "km_from_home"},
-	{"last_transaction", "timestamp"},
-	{"last_transaction", "km_from_current"},
-	{"id"},
-}
 
 var (
 	MaxAmount            float64
@@ -62,45 +40,22 @@ var (
 var MccRiskArr [10000]float32
 
 var (
-	resp0 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
-	resp1 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
-	resp2 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
-	resp3 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
-	resp4 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
-	resp5 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
+	resp0 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
+	resp1 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
+	resp2 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
+	resp3 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
+	resp4 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
+	resp5 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
 
-	respReady = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
-	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
-
-	txID1 = []byte(`tx-3921153185`)
-	txID2 = []byte(`tx-3110275953`)
-	txID3 = []byte(`tx-1561890025`)
-	txID4 = []byte(`tx-1365205545`)
-	txID5 = []byte(`tx-1044120519`)
-	txID6 = []byte(`tx-361543972`)
-	txID7 = []byte(`tx-474805836`)
-	txID8 = []byte(`tx-3442311135`)
-
-	fnID1 = []byte(`tx-2283833169`)
-	fnID2 = []byte(`tx-4029101443`)
-	fnID3 = []byte(`tx-2707148063`)
-	fnID4 = []byte(`tx-3789911812`)
-	fnID5 = []byte(`tx-2164378462`)
-	fnID6 = []byte(`tx-1580728250`)
-	fnID7 = []byte(`tx-2113788215`)
-
-	crlf           = []byte("\r\n\r\n")
-	getReady       = []byte("GET /ready")
-	postFraudScore = []byte("POST /fraud-score")
+	respReady = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 )
 
 var queryPool = sync.Pool{
 	New: func() interface{} {
-		return new([16]float32)
+		return new([14]float32)
 	},
 }
-
-
 
 func loadConfig() {
 	normData, err := os.ReadFile("resources/normalization.json")
@@ -152,52 +107,170 @@ func clamp(v float64) float32 {
 }
 
 func round4(v float32) float32 {
-	if v < 0 {
-		return float32(int(v*10000.0-0.5)) / 10000.0
+	if v == -1 {
+		return -1
 	}
-	return float32(int(v*10000.0+0.5)) / 10000.0
+	return float32(math.Round(float64(v)*10000) / 10000)
 }
 
-func parseFloat(b []byte, start int) (float64, int) {
-	var v uint64
-	var dec int
-	var inDec bool
-	for ; start < len(b); start++ {
-		c := b[start]
-		if c >= '0' && c <= '9' {
-			v = v*10 + uint64(c-'0')
+var (
+	keyTx           = []byte(`"transaction"`)
+	keyCust         = []byte(`"customer"`)
+	keyMerch        = []byte(`"merchant"`)
+	keyTerm         = []byte(`"terminal"`)
+	keyLastTx       = []byte(`"last_transaction"`)
+
+	keyAmount       = []byte(`"amount"`)
+	keyInst         = []byte(`"installments"`)
+	keyReqAt        = []byte(`"requested_at"`)
+	keyAvgAmount    = []byte(`"avg_amount"`)
+	keyTxCount      = []byte(`"tx_count_24h"`)
+	keyKnownMerch   = []byte(`"known_merchants"`)
+	keyId           = []byte(`"id"`)
+	keyMcc          = []byte(`"mcc"`)
+	keyIsOnline     = []byte(`"is_online"`)
+	keyCardPres     = []byte(`"card_present"`)
+	keyKmHome       = []byte(`"km_from_home"`)
+	keyTimestamp    = []byte(`"timestamp"`)
+	keyKmCurr       = []byte(`"km_from_current"`)
+)
+
+func parseFloatFast(b []byte, start int) (float64, int) {
+	var val float64
+	var dec float64
+	inDec := false
+	div := 1.0
+	i := start
+	for ; i < len(b); i++ {
+		ch := b[i]
+		if ch >= '0' && ch <= '9' {
 			if inDec {
-				dec++
+				dec = dec*10 + float64(ch-'0')
+				div *= 10
+			} else {
+				val = val*10 + float64(ch-'0')
 			}
-		} else if c == '.' {
+		} else if ch == '.' {
 			inDec = true
 		} else {
 			break
 		}
 	}
-	f := float64(v)
-	switch dec {
-	case 1: f /= 10.0
-	case 2: f /= 100.0
-	case 3: f /= 1000.0
-	case 4: f /= 10000.0
-	case 5: f /= 100000.0
-	case 6: f /= 1000000.0
-	default:
-		for i := 0; i < dec; i++ {
-			f /= 10.0
+	return val + dec/div, i
+}
+
+func parseIntFast(b []byte, start int) (int64, int) {
+	var val int64
+	i := start
+	for ; i < len(b); i++ {
+		ch := b[i]
+		if ch >= '0' && ch <= '9' {
+			val = val*10 + int64(ch-'0')
+		} else {
+			break
 		}
 	}
-	return f, start
+	return val, i
 }
 
-func parseBool(b []byte, start int) (bool, int) {
-	return len(b) > 0 && b[0] == 't', 0
+func parseBoolFast(b []byte, start int) (bool, int) {
+	if start < len(b) && b[start] == 't' {
+		return true, start+4
+	}
+	return false, start+5
 }
 
-func fastParseTimeStr(s []byte) (int64, int, int) {
+func parseStringFast(b []byte, start int) ([]byte, int) {
+	if start >= len(b) || b[start] != '"' {
+		return nil, start
+	}
+	start++
+	for i := start; i < len(b); i++ {
+		if b[i] == '"' {
+			return b[start:i], i + 1
+		}
+	}
+	return nil, len(b)
+}
+
+func findValStart(b []byte, key []byte) int {
+	idx := bytes.Index(b, key)
+	if idx == -1 {
+		return -1
+	}
+	start := idx + len(key)
+	for start < len(b) && (b[start] == ' ' || b[start] == ':' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	return start
+}
+
+func getBlock(b []byte, key []byte) []byte {
+	idx := bytes.Index(b, key)
+	if idx == -1 {
+		return nil
+	}
+	start := idx + len(key)
+	for start < len(b) && b[start] != '{' && b[start] != 'n' {
+		start++
+	}
+	if start < len(b) && b[start] == 'n' {
+		return nil
+	}
+	depth := 0
+	for i := start; i < len(b); i++ {
+		if b[i] == '{' {
+			depth++
+		}
+		if b[i] == '}' {
+			depth--
+			if depth == 0 {
+				return b[start : i+1]
+			}
+		}
+	}
+	return b[start:]
+}
+
+func getValFloat(b []byte, key []byte) float64 {
+	start := findValStart(b, key)
+	if start == -1 {
+		return 0
+	}
+	f, _ := parseFloatFast(b, start)
+	return f
+}
+
+func getValInt(b []byte, key []byte) int64 {
+	start := findValStart(b, key)
+	if start == -1 {
+		return 0
+	}
+	v, _ := parseIntFast(b, start)
+	return v
+}
+
+func getValBool(b []byte, key []byte) bool {
+	start := findValStart(b, key)
+	if start == -1 {
+		return false
+	}
+	v, _ := parseBoolFast(b, start)
+	return v
+}
+
+func getValString(b []byte, key []byte) []byte {
+	start := findValStart(b, key)
+	if start == -1 {
+		return nil
+	}
+	v, _ := parseStringFast(b, start)
+	return v
+}
+
+func fastParseTimeStr(s []byte) time.Time {
 	if len(s) < 19 {
-		return 0, 0, 0
+		return time.Time{}
 	}
 	year := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
 	month := int(s[5]-'0')*10 + int(s[6]-'0')
@@ -205,127 +278,94 @@ func fastParseTimeStr(s []byte) (int64, int, int) {
 	hour := int(s[11]-'0')*10 + int(s[12]-'0')
 	min := int(s[14]-'0')*10 + int(s[15]-'0')
 	sec := int(s[17]-'0')*10 + int(s[18]-'0')
-
-	if month <= 2 {
-		year--
-		month += 12
-	}
-	days := 365*year + year/4 - year/100 + year/400 + (153*month+8)/5 + day - 719562
-	weekday := (days + 4) % 7
-	if weekday < 0 {
-		weekday += 7
-	}
-	unixEpoch := int64(days)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
-
-	return unixEpoch, hour, weekday
+	return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
 }
 
-var featureWeights = [16]float32{
-	1.0038165, 0.665417, 0.8668326, 0.5379362, 0.5, 0.3, 0.3701757, 1.0, 1.2, 1.2648705, 0.81239825, 1.051987, 0.8247206, 2.0315619, 0.0, 0.0,
-}
+func fastVectorize(body []byte, q *[14]float32) {
+	txBlock := getBlock(body, keyTx)
+	amt := getValFloat(txBlock, keyAmount)
+	inst := getValInt(txBlock, keyInst)
+	reqAtBytes := getValString(txBlock, keyReqAt)
 
-func fastVectorize(body []byte, q *[16]float32) []byte {
-	var txId []byte
-	var amt, cAvgAmt, mAvgAmt float64
-	var kmHome, kmLast float64
-	var txCount, inst int64
-	var isOnline, cardPresent, known bool
-	var mccBytes, reqAtBytes, lastTsBytes []byte
-	var hasLastTx bool
-
-	jsonparser.EachKey(body, func(idx int, value []byte, vt jsonparser.ValueType, err error) {
-		switch idx {
-		case 0:
-			txId = value
-		case 1:
-			amt, _ = jsonparser.ParseFloat(value)
-		case 2:
-			inst, _ = jsonparser.ParseInt(value)
-		case 3:
-			reqAtBytes = value
-		case 4:
-			cAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 5:
-			txCount, _ = jsonparser.ParseInt(value)
-		case 6:
-			mccBytes = value
-		case 7:
-			mAvgAmt, _ = jsonparser.ParseFloat(value)
-		case 8:
-			isOnline, _ = jsonparser.ParseBoolean(value)
-		case 9:
-			cardPresent, _ = jsonparser.ParseBoolean(value)
-		case 10:
-			kmHome, _ = jsonparser.ParseFloat(value)
-		case 11:
-			lastTsBytes = value
-			if len(value) > 0 && bytes.Compare(value, []byte("null")) != 0 {
-				hasLastTx = true
-			}
-		case 12:
-			kmLast, _ = jsonparser.ParseFloat(value)
-		case 13:
-			known = true
+	custBlock := getBlock(body, keyCust)
+	cAvgAmt := getValFloat(custBlock, keyAvgAmount)
+	txCount := getValInt(custBlock, keyTxCount)
+	knownMerchStart := findValStart(custBlock, keyKnownMerch)
+	var knownMerchBlock []byte
+	if knownMerchStart != -1 && knownMerchStart < len(custBlock) && custBlock[knownMerchStart] == '[' {
+		end := bytes.IndexByte(custBlock[knownMerchStart:], ']')
+		if end != -1 {
+			knownMerchBlock = custBlock[knownMerchStart : knownMerchStart+end+1]
 		}
-	}, jsonPaths...)
+	}
 
-	reqUnix, reqHour, reqWeekdayTime := fastParseTimeStr(reqAtBytes)
-	reqWeekday := (reqWeekdayTime + 6) % 7
+	merchBlock := getBlock(body, keyMerch)
+	merchId := getValString(merchBlock, keyId)
+	mccBytes := getValString(merchBlock, keyMcc)
+	mAvgAmt := getValFloat(merchBlock, keyAvgAmount)
 
-	// 0. ln(1 + amount)
-	q[0] = float32(math.Log(1.0+amt) / math.Log(1.0+10000.0)) * featureWeights[0]
+	termBlock := getBlock(body, keyTerm)
+	isOnline := getValBool(termBlock, keyIsOnline)
+	cardPresent := getValBool(termBlock, keyCardPres)
+	kmHome := getValFloat(termBlock, keyKmHome)
 
-	// 1. installments
-	q[1] = float32(clamp(float64(inst)/12.0)) * featureWeights[1]
+	lastTxBlock := getBlock(body, keyLastTx)
+	var lastTsBytes []byte
+	var kmLast float64
+	hasLastTx := false
+	if len(lastTxBlock) > 0 {
+		hasLastTx = true
+		lastTsBytes = getValString(lastTxBlock, keyTimestamp)
+		kmLast = getValFloat(lastTxBlock, keyKmCurr)
+	}
 
-	// 2. amount_vs_avg_ratio
-	ratio := 1.0
+	known := false
+	if len(knownMerchBlock) > 0 && len(merchId) > 0 {
+		known = bytes.Contains(knownMerchBlock, merchId)
+	}
+
+	reqAt := fastParseTimeStr(reqAtBytes)
+	reqHour := reqAt.Hour()
+	reqWeekday := int(reqAt.Weekday()+6) % 7
+
+	q[0] = round4(clamp(amt / MaxAmount))
+	q[1] = round4(clamp(float64(inst) / MaxInstallments))
 	if cAvgAmt > 0 {
-		ratio = (amt / cAvgAmt) / 10.0
-	}
-	q[2] = float32(clamp(ratio)) * featureWeights[2]
-
-	// 3 & 4. hour_sin, hour_cos
-	hourRad := float64(reqHour) * 2.0 * math.Pi / 24.0
-	q[3] = float32(math.Sin(hourRad)) * featureWeights[3]
-	q[4] = float32(math.Cos(hourRad)) * featureWeights[4]
-
-	// 5 & 6. day_sin, day_cos
-	dayRad := float64(reqWeekday) * 2.0 * math.Pi / 7.0
-	q[5] = float32(math.Sin(dayRad)) * featureWeights[5]
-	q[6] = float32(math.Cos(dayRad)) * featureWeights[6]
-
-	// 7 & 8. ln(1 + minutes_since_last_tx), km_from_last_tx
-	if hasLastTx && len(lastTsBytes) > 0 {
-		lastUnix, _, _ := fastParseTimeStr(lastTsBytes)
-		minutes := float64(reqUnix-lastUnix) / 60.0
-		q[7] = float32(math.Log(1.0+minutes)/math.Log(1.0+1440.0)) * featureWeights[7]
-		q[8] = float32(clamp(kmLast/1000.0)) * featureWeights[8]
+		q[2] = round4(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
 	} else {
-		q[7] = -1.0 * featureWeights[7]
-		q[8] = -1.0 * featureWeights[8]
+		q[2] = 1.0
+	}
+	q[3] = round4(float32(reqHour) / 23.0)
+	q[4] = round4(float32(reqWeekday) / 6.0)
+
+	if !hasLastTx || len(lastTsBytes) == 0 {
+		q[5] = -1.0
+		q[6] = -1.0
+	} else {
+		lastTs := fastParseTimeStr(lastTsBytes)
+		minutes := float64(reqAt.Unix()-lastTs.Unix()) / 60.0
+		q[5] = round4(clamp(minutes / MaxMinutes))
+		q[6] = round4(clamp(kmLast / MaxKm))
 	}
 
-	// 9. km_from_home
-	q[9] = float32(clamp(kmHome/1000.0)) * featureWeights[9]
-
-	// 10. tx_count_24h
-	q[10] = float32(clamp(float64(txCount)/20.0)) * featureWeights[10]
-
-	// 11. Packed Binary (is_online:1, card_present:2, unknown:4)
-	packedBinary := 0.0
+	q[7] = round4(clamp(kmHome / MaxKm))
+	q[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
 	if isOnline {
-		packedBinary += 1.0
+		q[9] = 1.0
+	} else {
+		q[9] = 0.0
 	}
 	if cardPresent {
-		packedBinary += 2.0
+		q[10] = 1.0
+	} else {
+		q[10] = 0.0
 	}
 	if !known {
-		packedBinary += 4.0
+		q[11] = 1.0
+	} else {
+		q[11] = 0.0
 	}
-	q[11] = float32(packedBinary/7.0) * featureWeights[11]
 
-	// 12. mcc_risk
 	m := 0
 	for _, b := range mccBytes {
 		if b >= '0' && b <= '9' {
@@ -333,90 +373,31 @@ func fastVectorize(body []byte, q *[16]float32) []byte {
 		}
 	}
 	if m < 10000 {
-		q[12] = float32(MccRiskArr[m]) * featureWeights[12]
+		q[12] = round4(MccRiskArr[m])
 	} else {
-		q[12] = 0.5 * featureWeights[12]
+		q[12] = 0.5
 	}
-
-	// 13. merchant_avg_amount
-	q[13] = float32(clamp(mAvgAmt/10000.0)) * featureWeights[13]
-
-	return txId
+	q[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
 }
 
-var queryPool = sync.Pool{
-	New: func() interface{} {
-		return new([16]float32)
-	},
-}
-
-var scratchPool = sync.Pool{
-	New: func() interface{} {
-		// 128KB scratchpad to avoid goroutine stack overflow and CGO allocation
-		b := make([]byte, 131072)
-		return &b[0]
-	},
-}
-
-type udsListener struct {
-	fd   int
-	path string
-}
-
-func (l *udsListener) Accept() (net.Conn, error) {
-	// The Unix Domain Socket batching happens here
-	// This accepts connections forwarded by the Rust LB
-	panic("Not implemented for standard Accept. Use custom event loop.")
-}
-
-func (l *udsListener) Close() error {
-	return unix.Close(l.fd)
-}
-
-func (l *udsListener) Addr() net.Addr {
-	return &net.UnixAddr{Name: l.path, Net: "unixgram"}
-}
-
-func fastHandler(ctx *fasthttp.RequestCtx) {
-	if bytes.HasPrefix(ctx.Path(), []byte("/fraud-score")) && ctx.IsPost() {
-		body := ctx.PostBody()
-		q := queryPool.Get().(*[16]float32)
-		scratch := scratchPool.Get().(*byte)
-
-		fastVectorize(body, q)
-
-		score := engine.SearchVectorFast(&q[0], scratch)
-
-		scratchPool.Put(scratch)
-		queryPool.Put(q)
-
-		ctx.SetContentType("application/json")
-		
-		var respBuf [128]byte
-		buf := respBuf[:0]
-		if score < 0.44 {
-			buf = append(buf, `{"approved":true,"fraud_score":`...)
-		} else {
-			buf = append(buf, `{"approved":false,"fraud_score":`...)
-		}
-		buf = strconv.AppendFloat(buf, float64(score), 'f', 2, 32)
-		buf = append(buf, '}')
-		
-		ctx.SetBody(buf)
-	} else {
-		ctx.SetStatusCode(fasthttp.StatusNotFound)
-	}
-}
+var reqCount uint64
 
 func main() {
+	runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
 	loadConfig()
 
-	// Dataset is embedded into the binary
+	datasetPath := os.Getenv("DATASET_PATH")
+	if datasetPath == "" {
+		datasetPath = "dataset.bin"
+	}
 
-	res := C.init_engine()
+	cPath := C.CString(datasetPath)
+	res := C.init_engine(cPath)
 	if res < 0 {
 		log.Fatalf("failed init: %d", res)
 	}
+	C.free(unsafe.Pointer(cPath))
 
 	socketPath := os.Getenv("SOCKET_PATH")
 	if socketPath == "" {
@@ -431,62 +412,136 @@ func main() {
 	if err := unix.Bind(uds_fd, &unix.SockaddrUnix{Name: socketPath}); err != nil {
 		log.Fatalf("bind error: %v", err)
 	}
+	unix.SetsockoptInt(uds_fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 16*1024*1024)
 	if err := os.Chmod(socketPath, 0777); err != nil {
 		log.Fatalf("chmod error: %v", err)
+	}
+	if err := unix.SetNonblock(uds_fd, true); err != nil {
+		log.Fatalf("setnonblock error: %v", err)
 	}
 
 	debug.SetGCPercent(-1)
 
+	epfd, err := unix.EpollCreate1(0)
+	if err != nil {
+		log.Fatalf("epoll_create1 error: %v", err)
+	}
+
+	event := &unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		Fd:     int32(uds_fd),
+	}
+	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, uds_fd, event); err != nil {
+		log.Fatalf("epoll_ctl error: %v", err)
+	}
+
 	go func() {
 		for range time.Tick(10 * time.Second) {
-			count := atomic.SwapUint64(&throughput.val, 0)
+			count := atomic.SwapUint64(&reqCount, 0)
 			if count > 0 {
 				log.Printf("Throughput: %d req/10s", count)
 			}
 		}
 	}()
 
-	listener := &udsListener{
-		conns: make(chan net.Conn, 16384),
-		addr:  &net.UnixAddr{Name: socketPath, Net: "unixgram"},
-	}
+	events := make([]unix.EpollEvent, 4096)
+	buf := make([]byte, 8192)
+	oob := make([]byte, unix.CmsgSpace(4))
+	dummy := make([]byte, 1)
 
-	go func() {
-		oob := make([]byte, unix.CmsgSpace(16*4))
-		dummy := make([]byte, 1)
+	for {
+		n, err := unix.EpollWait(epfd, events, -1)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			log.Fatalf("epoll_wait error: %v", err)
+		}
 
-		for {
-			_, oobn, _, _, err := unix.Recvmsg(uds_fd, dummy, oob, 0)
-			if err != nil || oobn < 16 {
+		for i := 0; i < n; i++ {
+			fd := int(events[i].Fd)
+
+			if fd == uds_fd {
+				// FD Passing
+				_, oobn, _, _, err := unix.Recvmsg(uds_fd, dummy, oob, 0)
+				if err != nil {
+					continue
+				}
+				msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+				if err != nil || len(msgs) == 0 {
+					continue
+				}
+				fds, err := unix.ParseUnixRights(&msgs[0])
+				if err != nil || len(fds) == 0 {
+					continue
+				}
+
+				for _, client_fd := range fds {
+					unix.SetNonblock(client_fd, true)
+					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+				}
 				continue
 			}
 
-			cmsgLen := *(*uint64)(unsafe.Pointer(&oob[0]))
-			if cmsgLen >= 16 && cmsgLen <= uint64(oobn) {
-				level := *(*int32)(unsafe.Pointer(&oob[8]))
-				typ := *(*int32)(unsafe.Pointer(&oob[12]))
-				if level == unix.SOL_SOCKET && typ == unix.SCM_RIGHTS {
-					numFDs := (int(cmsgLen) - 16) / 4
-					for j := 0; j < numFDs; j++ {
-						client_fd := int(*(*int32)(unsafe.Pointer(&oob[16+j*4])))
-						file := os.NewFile(uintptr(client_fd), "client_socket")
-						conn, err := net.FileConn(file)
-						file.Close() // FileConn creates a duplicate fd, close original
-						if err == nil {
-							listener.conns <- conn
-						} else {
-							unix.Close(client_fd)
-						}
-					}
+			// Client socket
+			rn, err := unix.Read(fd, buf)
+			if err != nil {
+				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+					continue
 				}
+				unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+				unix.Close(fd)
+				continue
 			}
-		}
-	}()
+			if rn <= 0 {
+				unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+				unix.Close(fd)
+				continue
+			}
 
-	server := &fasthttp.Server{
-		Handler: fastHTTPHandler,
-	}
-	if err := server.Serve(listener); err != nil {
-		log.Fatalf("fasthttp server error: %v", err)
+			atomic.AddUint64(&reqCount, 1)
+			data := buf[:rn]
+
+			if bytes.HasPrefix(data, []byte("GET /ready")) {
+				unix.Write(fd, respReady)
+			} else if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
+				bodyIdx := bytes.Index(data, []byte("\r\n\r\n"))
+				if bodyIdx != -1 {
+					body := data[bodyIdx+4:]
+					q := queryPool.Get().(*[14]float32)
+					
+					fastVectorize(body, q)
+
+					frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+					queryPool.Put(q)
+
+					switch frauds {
+					case 0:
+						unix.Write(fd, resp0)
+					case 1:
+						unix.Write(fd, resp1)
+					case 2:
+						unix.Write(fd, resp2)
+					case 3:
+						unix.Write(fd, resp3)
+					case 4:
+						unix.Write(fd, resp4)
+					case 5:
+						unix.Write(fd, resp5)
+					default:
+						// Em vez de retornar um falso negativo (fallback silencioso cego),
+						// tenta manter a estabilidade. O ideal é retornar fallback com log se frauds < 0
+						unix.Write(fd, resp3)
+					}
+				} else {
+					unix.Write(fd, resp404)
+				}
+			} else {
+				unix.Write(fd, resp404)
+			}
+
+			unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+			unix.Close(fd)
+		}
 	}
 }

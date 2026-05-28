@@ -7,16 +7,16 @@ TEXT ·SearchVectorFast(SB), NOSPLIT, $128-24
     MOVQ q+0(FP), DI         // arg 1: *float32 -> RDI
     MOVQ scratch+8(FP), SI   // arg 2: *byte -> RSI
 
-    // We must ensure the stack pointer (SP) is 16-byte aligned before CALL (C ABI requirement).
-    // Go stacks are usually not 16-byte aligned precisely.
-    // Save current SP to BP, then align SP.
-    MOVQ SP, BP
-    ANDQ $~15, SP
+    // Switch SP to the top of the scratch buffer (128KB) to avoid Go stack overflow
+    // Save current SP to R12 (callee-saved in C ABI)
+    MOVQ SP, R12
+    LEAQ 131072(SI), SP
+    ANDQ $~15, SP // align to 16 bytes
 
     CALL search_vector(SB)
 
-    // Restore SP
-    MOVQ BP, SP
+    // Restore Go SP
+    MOVQ R12, SP
 
     // Return value from C function is in XMM0 (float)
     MOVSS X0, ret+16(FP)
