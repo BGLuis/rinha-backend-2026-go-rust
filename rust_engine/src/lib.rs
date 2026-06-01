@@ -50,7 +50,8 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         NUM_CLUSTERS = k;
 
         let centroids_ptr = ptr.add(64) as *const [i16; 16];
-        CENTROIDS = Some(slice::from_raw_parts(centroids_ptr, k));
+        let centroids = slice::from_raw_parts(centroids_ptr, k);
+        CENTROIDS = Some(centroids);
 
         let bboxes_ptr = ptr.add(64 + k * 32) as *const [i16; 32];
         BBOXES = Some(slice::from_raw_parts(bboxes_ptr, k));
