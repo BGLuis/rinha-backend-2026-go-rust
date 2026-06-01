@@ -77,11 +77,11 @@ COPY --from=rust-builder /build/rust_engine/target/release/librust_engine.a /usr
 # Copia o perfil PGO coletado
 COPY --from=pgo-collector /app/cpu.pprof ./default.pgo
 
-# Compilação Go vinculando a lib Rust via CGO, com PGO ativado
-RUN CGO_ENABLED=1 GOOS=linux go build -pgo=default.pgo -ldflags="-s -w" -o rinha-api .
+# Compilação Go vinculando a lib Rust via CGO, com PGO ativado e AVX2 (v3)
+RUN CGO_ENABLED=1 GOOS=linux GOAMD64=v3 go build -pgo=default.pgo -ldflags="-s -w" -o rinha-api .
 
 # --- Estágio Final: Imagem de Produção Enxuta ---
-FROM debian:bookworm-slim
+FROM gcr.io/distroless/cc-debian12:latest
 WORKDIR /app
 
 # Artefatos finais
