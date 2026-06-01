@@ -36,6 +36,7 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         if ptr == libc::MAP_FAILED { return -4; }
         libc::close(fd);
 
+        libc::madvise(ptr, len, libc::MADV_WILLNEED);
         libc::mlock(ptr, len);
 
         let header = slice::from_raw_parts(ptr as *const u32, 16);
@@ -58,6 +59,13 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         NUM_BLOCKS = Some(slice::from_raw_parts(num_blocks_ptr, k));
 
         MMAP_PTR = Some(ptr as *const u8);
+
+        // Warmup: Synthetic searches to train BPU and L3 Cache
+        let dummy_query = [0.0f32; 14];
+        for _ in 0..1000 {
+            search_vector(dummy_query.as_ptr(), 0);
+        }
+
         0
     }
 }
@@ -185,7 +193,7 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     }
 
     let sub = &mut centroid_dists[0..n_centroids];
-    sub.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    sub.sort_unstable_by(|a, b| a.0.cmp(&b.0)); // REQUIRED: BBox pruning depends on visiting nearest centroids first
 
     let mut top_dists = [i32::MAX; 5];
     let mut top_indices = [0u32; 5];
@@ -193,7 +201,7 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
 
     let nprobe = n_centroids;
     
-    sub.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // sub.sort_unstable_by(|a, b| a.0.cmp(&b.0)); // REMOVED: Redundant sort
 
     for i in 0..nprobe {
         let ki = sub[i].1;
