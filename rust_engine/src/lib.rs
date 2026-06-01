@@ -12,16 +12,8 @@ static mut OFFSETS: Option<&'static [u32]> = None;
 static mut NUM_BLOCKS: Option<&'static [u32]> = None;
 static mut NUM_CLUSTERS: usize = 0;
 
-#[derive(Clone, Copy)]
-struct BVHNode {
-    bbox: [i16; 32],
-    left: i32,
-    right: i32,
-    cluster_idx: i32,
-}
-
-static mut BVH_NODES: Option<Vec<BVHNode>> = None;
-static mut ROOT_NODE: usize = 0;
+static mut SUPER_BBOXES: Option<Vec<[i16; 32]>> = None;
+static mut SUPER_INDEX: Option<Vec<Vec<usize>>> = None;
 
 #[no_mangle]
 pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
@@ -72,68 +64,66 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
 
         MMAP_PTR = Some(ptr as *const u8);
 
-        fn merge_bbox(a: &[i16; 32], b: &[i16; 32]) -> [i16; 32] {
-            let mut res = [0i16; 32];
-            for i in 0..16 {
-                res[i] = std::cmp::min(a[i], b[i]);
-                res[i + 16] = std::cmp::max(a[i + 16], b[i + 16]);
-            }
-            res
+        // Build Exact Flat BVH (Super-BBoxes) for SIMD-friendly pruning
+        let num_super = 91;
+        let mut super_centroids = vec![[0i16; 16]; num_super];
+        for i in 0..num_super {
+            super_centroids[i] = centroids[i * (k / num_super)];
         }
-
-        fn build_bvh(indices: &mut [usize], bboxes: &[[i16; 32]], nodes: &mut Vec<BVHNode>) -> usize {
-            if indices.len() == 1 {
-                let node_idx = nodes.len();
-                nodes.push(BVHNode {
-                    bbox: bboxes[indices[0]],
-                    left: -1,
-                    right: -1,
-                    cluster_idx: indices[0] as i32,
-                });
-                return node_idx;
-            }
-
-            let mut merged = bboxes[indices[0]];
-            for &idx in &indices[1..] {
-                merged = merge_bbox(&merged, &bboxes[idx]);
-            }
-
-            let mut max_spread = -1;
-            let mut split_axis = 0;
-            for i in 0..16 {
-                let spread = (merged[i + 16] as i32) - (merged[i] as i32);
-                if spread > max_spread {
-                    max_spread = spread;
-                    split_axis = i;
+        
+        let mut assignment = vec![0; k];
+        for _ in 0..5 {
+            let mut sums = vec![[0i32; 16]; num_super];
+            let mut counts = vec![0; num_super];
+            for i in 0..k {
+                let mut best_d = i32::MAX;
+                let mut best_s = 0;
+                let c_vec = _mm256_loadu_si256(centroids[i].as_ptr() as *const __m256i);
+                for s in 0..num_super {
+                    let d = dist_avx2_i16(c_vec, super_centroids[s].as_ptr());
+                    if d < best_d {
+                        best_d = d;
+                        best_s = s;
+                    }
+                }
+                assignment[i] = best_s;
+                counts[best_s] += 1;
+                for j in 0..16 {
+                    sums[best_s][j] += centroids[i][j] as i32;
                 }
             }
-
-            indices.sort_unstable_by_key(|&idx| {
-                (bboxes[idx][split_axis] as i32) + (bboxes[idx][split_axis + 16] as i32)
-            });
-
-            let mid = indices.len() / 2;
-            let mut left_indices = indices[..mid].to_vec();
-            let mut right_indices = indices[mid..].to_vec();
-            
-            let left = build_bvh(&mut left_indices, bboxes, nodes);
-            let right = build_bvh(&mut right_indices, bboxes, nodes);
-
-            let node_idx = nodes.len();
-            nodes.push(BVHNode {
-                bbox: merged,
-                left: left as i32,
-                right: right as i32,
-                cluster_idx: -1,
-            });
-            node_idx
+            for s in 0..num_super {
+                if counts[s] > 0 {
+                    for j in 0..16 {
+                        super_centroids[s][j] = (sums[s][j] / counts[s]) as i16;
+                    }
+                }
+            }
+        }
+        
+        let mut super_index = vec![Vec::with_capacity(k / num_super * 2); num_super];
+        for i in 0..k {
+            super_index[assignment[i]].push(i);
+        }
+        
+        // Compute the EXACT Bounding Box for each Super-Centroid group
+        let bboxes = BBOXES.unwrap();
+        let mut super_bboxes = vec![[0i16; 32]; num_super];
+        for s in 0..num_super {
+            if super_index[s].is_empty() { continue; }
+            let first = super_index[s][0];
+            let mut s_bbox = bboxes[first];
+            for &idx in &super_index[s][1..] {
+                for j in 0..16 {
+                    s_bbox[j] = std::cmp::min(s_bbox[j], bboxes[idx][j]);
+                    s_bbox[j + 16] = std::cmp::max(s_bbox[j + 16], bboxes[idx][j + 16]);
+                }
+            }
+            super_bboxes[s] = s_bbox;
         }
 
-        let mut bvh_nodes = Vec::with_capacity(k * 2);
-        let mut indices: Vec<usize> = (0..k).collect();
-        let root_idx = build_bvh(&mut indices, BBOXES.unwrap(), &mut bvh_nodes);
-        BVH_NODES = Some(bvh_nodes);
-        ROOT_NODE = root_idx;
+        SUPER_BBOXES = Some(super_bboxes);
+        SUPER_INDEX = Some(super_index);
 
         // Warmup: Synthetic searches to train BPU and L3 Cache
         let dummy_query = [0.0f32; 14];
@@ -260,7 +250,9 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
 
     let q_vec = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
 
-    let bvh = BVH_NODES.as_ref().unwrap();
+    let super_bboxes = SUPER_BBOXES.as_ref().unwrap();
+    let super_index = SUPER_INDEX.as_ref().unwrap();
+    let bboxes = BBOXES.unwrap();
     let mmap_ptr = MMAP_PTR.unwrap();
     let offsets = OFFSETS.unwrap();
     let num_blocks = NUM_BLOCKS.unwrap();
@@ -269,44 +261,31 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     let mut top_indices = [0u32; 5];
     let mut top_labels = [0u32; 5];
 
-    let mut stack = [0usize; 64];
-    let mut stack_ptr = 0;
-    stack[0] = ROOT_NODE;
-    stack_ptr += 1;
+    let mut super_dists = [(0i32, 0usize); 91];
+    for s in 0..91 {
+        super_dists[s] = (min_dist_to_bbox_avx2(q_vec, super_bboxes[s].as_ptr()), s);
+    }
+    super_dists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    while stack_ptr > 0 {
-        stack_ptr -= 1;
-        let node = &bvh[stack[stack_ptr]];
-
-        if min_dist_to_bbox_avx2(q_vec, node.bbox.as_ptr()) >= top_dists[4] {
-            continue;
+    for s in 0..91 {
+        if super_dists[s].0 >= top_dists[4] { break; } // Exact pruning at Super-BBox level
+        let s_idx = super_dists[s].1;
+        
+        let count = super_index[s_idx].len();
+        let mut child_dists = [(0i32, 0usize); 512]; // max possible size to prevent overflow
+        for i in 0..count {
+            let ki = super_index[s_idx][i];
+            child_dists[i] = (min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()), ki);
         }
-
-        if node.left == -1 {
-            scan_cluster_aos(node.cluster_idx as usize, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
-        } else {
-            let left_dist = min_dist_to_bbox_avx2(q_vec, bvh[node.left as usize].bbox.as_ptr());
-            let right_dist = min_dist_to_bbox_avx2(q_vec, bvh[node.right as usize].bbox.as_ptr());
-
-            if left_dist > right_dist {
-                if left_dist < top_dists[4] {
-                    stack[stack_ptr] = node.left as usize;
-                    stack_ptr += 1;
-                }
-                if right_dist < top_dists[4] {
-                    stack[stack_ptr] = node.right as usize;
-                    stack_ptr += 1;
-                }
-            } else {
-                if right_dist < top_dists[4] {
-                    stack[stack_ptr] = node.right as usize;
-                    stack_ptr += 1;
-                }
-                if left_dist < top_dists[4] {
-                    stack[stack_ptr] = node.left as usize;
-                    stack_ptr += 1;
-                }
-            }
+        
+        // Sort children so we visit the closest BBoxes first, shrinking top_dists[4] ASAP!
+        let sub = &mut child_dists[0..count];
+        sub.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        
+        for i in 0..count {
+            if sub[i].0 >= top_dists[4] { break; } // Exact pruning at cluster BBox level
+            let ki = sub[i].1;
+            scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
         }
     }
 
