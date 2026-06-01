@@ -170,13 +170,15 @@ unsafe fn min_dist_to_bbox_avx2(q_vec: __m256i, bbox_ptr: *const i16) -> i32 {
     let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let masked_diff = _mm256_and_si256(diff, mask);
     
-    let sums = _mm256_madd_epi16(masked_diff, masked_diff);
-    let sum1 = _mm256_add_epi32(sums, _mm256_shuffle_epi32(sums, 0b01001110));
-    let sum2 = _mm256_add_epi32(sum1, _mm256_shuffle_epi32(sum1, 0b10110001));
-    let sum_low = _mm256_castsi256_si128(sum2);
-    let sum_high = _mm256_extracti128_si256(sum2, 1);
-    let sum3 = _mm_add_epi32(sum_low, sum_high);
-    _mm_cvtsi128_si32(sum3)
+    let sq = _mm256_madd_epi16(masked_diff, masked_diff);
+    
+    let hi128 = _mm256_extracti128_si256(sq, 1);
+    let lo128 = _mm256_castsi256_si128(sq);
+    let s1 = _mm_add_epi32(hi128, lo128);
+    let s2 = _mm_add_epi32(s1, _mm_shuffle_epi32(s1, 0x4E));
+    let s3 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xB1));
+
+    _mm_cvtsi128_si32(s3)
 }
 
 #[inline(always)]
@@ -195,38 +197,49 @@ unsafe fn scan_cluster_aos(
     let blocks_count = num_blocks[ki] as usize;
     let mut ptr = mmap_ptr.add(offset);
     
+    let mut t_d = *top_dists;
+    let mut t_i = *top_indices;
+    let mut t_l = *top_labels;
+
     for _ in 0..blocks_count {
         let bbox = slice::from_raw_parts(ptr as *const i16, 32);
         let num_vectors = *(ptr.add(64) as *const u32) as usize;
         ptr = ptr.add(96);
         
-        if min_dist_to_bbox_avx2(q_vec, bbox.as_ptr()) < top_dists[4] {
+        if min_dist_to_bbox_avx2(q_vec, bbox.as_ptr()) < t_d[4] {
             let mut v_ptr = ptr as *const i16;
             for _ in 0..num_vectors {
                 let d = dist_avx2_i16(q_vec, v_ptr);
-                if d < top_dists[4] {
+                if d < t_d[4] {
                     let m0 = *v_ptr.add(14) as u16 as u32;
                     let m1 = *v_ptr.add(15) as u16 as u32;
                     let meta = m0 | (m1 << 16);
+                    
                     let idx = meta & 0x7FFFFFFF;
                     let label = meta >> 31;
-
-                    let mut pos = 4;
-                    while pos > 0 && d < top_dists[pos - 1] {
-                        top_dists[pos] = top_dists[pos - 1];
-                        top_indices[pos] = top_indices[pos - 1];
-                        top_labels[pos] = top_labels[pos - 1];
-                        pos -= 1;
+                    
+                    let mut k = 3;
+                    while k >= 0 && d < t_d[k] {
+                        t_d[k + 1] = t_d[k];
+                        t_i[k + 1] = t_i[k];
+                        t_l[k + 1] = t_l[k];
+                        if k == 0 { break; }
+                        k -= 1;
                     }
-                    top_dists[pos] = d;
-                    top_indices[pos] = idx;
-                    top_labels[pos] = label;
+                    let ins = if d < t_d[0] { 0 } else { k + 1 };
+                    t_d[ins] = d;
+                    t_i[ins] = idx;
+                    t_l[ins] = label;
                 }
                 v_ptr = v_ptr.add(16);
             }
         }
         ptr = ptr.add(num_vectors * 32);
     }
+    
+    *top_dists = t_d;
+    *top_indices = t_i;
+    *top_labels = t_l;
 }
 
 static FEATURE_WEIGHTS: [f32; 16] = [
