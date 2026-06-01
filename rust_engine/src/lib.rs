@@ -192,21 +192,45 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
         centroid_dists[i] = (dist_avx2_i16(q_vec, centroids[i].as_ptr()), i);
     }
 
-    let sub = &mut centroid_dists[0..n_centroids];
-    sub.sort_unstable_by(|a, b| a.0.cmp(&b.0)); // REQUIRED: BBox pruning depends on visiting nearest centroids first
-
     let mut top_dists = [i32::MAX; 5];
     let mut top_indices = [0u32; 5];
     let mut top_labels = [0u32; 5];
 
-    let nprobe = n_centroids;
+    let nprobe = 128;
     
-    // sub.sort_unstable_by(|a, b| a.0.cmp(&b.0)); // REMOVED: Redundant sort
-
-    for i in 0..nprobe {
-        let ki = sub[i].1;
-        if min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()) >= top_dists[4] { continue; }
-        scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
+    if n_centroids <= nprobe {
+        let sub = &mut centroid_dists[0..n_centroids];
+        sub.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for i in 0..n_centroids {
+            let ki = sub[i].1;
+            if min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()) >= top_dists[4] { continue; }
+            scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
+        }
+    } else {
+        let (sub_initial, _, rest) = centroid_dists[0..n_centroids].select_nth_unstable_by(nprobe, |a, b| a.0.cmp(&b.0));
+        sub_initial.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        
+        for i in 0..nprobe {
+            let ki = sub_initial[i].1;
+            if min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()) >= top_dists[4] { continue; }
+            scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
+        }
+        
+        let mut frauds = 0;
+        for i in 0..5 {
+            if top_dists[i] != i32::MAX && top_labels[i] == 1 {
+                frauds += 1;
+            }
+        }
+        
+        if frauds > 0 && frauds < 5 {
+            rest.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for i in 0..rest.len() {
+                let ki = rest[i].1;
+                if min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()) >= top_dists[4] { continue; }
+                scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
+            }
+        }
     }
 
     let mut frauds = 0;
