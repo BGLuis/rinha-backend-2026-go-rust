@@ -25,6 +25,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"rinha-api/engine"
 )
 
 var (
@@ -268,17 +269,41 @@ func getValString(b []byte, key []byte) []byte {
 	return v
 }
 
-func fastParseTimeStr(s []byte) time.Time {
+func fastParseTimeStr(s []byte) int64 {
 	if len(s) < 19 {
-		return time.Time{}
+		return 0
 	}
+	d2 := func(i int) int { return int(s[i]-'0')*10 + int(s[i+1]-'0') }
+
 	year := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
-	month := int(s[5]-'0')*10 + int(s[6]-'0')
-	day := int(s[8]-'0')*10 + int(s[9]-'0')
-	hour := int(s[11]-'0')*10 + int(s[12]-'0')
-	min := int(s[14]-'0')*10 + int(s[15]-'0')
-	sec := int(s[17]-'0')*10 + int(s[18]-'0')
-	return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC)
+	month := d2(5)
+	day := d2(8)
+	hour := d2(11)
+	min := d2(14)
+	sec := d2(17)
+
+	y := year
+	if month <= 2 {
+		y--
+	}
+	var era int
+	if y >= 0 {
+		era = y / 400
+	} else {
+		era = (y - 399) / 400
+	}
+	yoe := y - era*400
+	var m int
+	if month > 2 {
+		m = month - 3
+	} else {
+		m = month + 9
+	}
+	doy := (153*m+2)/5 + day - 1
+	doe := yoe*365 + yoe/4 - yoe/100 + doy
+	days := int64(era)*146097 + int64(doe) - 719468
+	
+	return days*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
 }
 
 func fastVectorize(body []byte, q *[14]float32) {
@@ -324,9 +349,19 @@ func fastVectorize(body []byte, q *[14]float32) {
 		known = bytes.Contains(knownMerchBlock, merchId)
 	}
 
-	reqAt := fastParseTimeStr(reqAtBytes)
-	reqHour := reqAt.Hour()
-	reqWeekday := int(reqAt.Weekday()+6) % 7
+	reqAtUnix := fastParseTimeStr(reqAtBytes)
+	reqHour := int((reqAtUnix % 86400) / 3600)
+	if reqHour < 0 {
+		reqHour += 24
+	}
+	days := reqAtUnix / 86400
+	if reqAtUnix < 0 && reqAtUnix%86400 != 0 {
+		days--
+	}
+	reqWeekday := int((days + 3) % 7)
+	if reqWeekday < 0 {
+		reqWeekday += 7
+	}
 
 	q[0] = round4(clamp(amt / MaxAmount))
 	q[1] = round4(clamp(float64(inst) / MaxInstallments))
@@ -342,8 +377,8 @@ func fastVectorize(body []byte, q *[14]float32) {
 		q[5] = -1.0
 		q[6] = -1.0
 	} else {
-		lastTs := fastParseTimeStr(lastTsBytes)
-		minutes := float64(reqAt.Unix()-lastTs.Unix()) / 60.0
+		lastTsUnix := fastParseTimeStr(lastTsBytes)
+		minutes := float64(reqAtUnix-lastTsUnix) / 60.0
 		q[5] = round4(clamp(minutes / MaxMinutes))
 		q[6] = round4(clamp(kmLast / MaxKm))
 	}
@@ -446,8 +481,15 @@ func main() {
 
 	events := make([]unix.EpollEvent, 4096)
 	buf := make([]byte, 8192)
-	oob := make([]byte, unix.CmsgSpace(4))
+	oob := make([]byte, unix.CmsgSpace(16*4))
 	dummy := make([]byte, 1)
+
+	var scratchPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 131072) // 128KB scratch buffer for C stack
+			return &b
+		},
+	}
 
 	for {
 		n, err := unix.EpollWait(epfd, events, -1)
@@ -512,7 +554,10 @@ func main() {
 					
 					fastVectorize(body, q)
 
-					frauds := C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+					scratch := scratchPool.Get().(*[]byte)
+					frauds := engine.SearchVectorFast(&q[0], &(*scratch)[0])
+					scratchPool.Put(scratch)
+					
 					queryPool.Put(q)
 
 					switch frauds {
