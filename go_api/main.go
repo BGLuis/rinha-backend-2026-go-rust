@@ -52,12 +52,6 @@ var (
 	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 )
 
-var queryPool = sync.Pool{
-	New: func() interface{} {
-		return new([14]float32)
-	},
-}
-
 func loadConfig() {
 	normData, err := os.ReadFile("resources/normalization.json")
 	if err != nil {
@@ -487,12 +481,8 @@ func main() {
 	oob := make([]byte, unix.CmsgSpace(16*4))
 	dummy := make([]byte, 1)
 
-	var scratchPool = sync.Pool{
-		New: func() interface{} {
-			b := make([]byte, 131072) // 128KB scratch buffer for C stack
-			return &b
-		},
-	}
+	var globalQuery [14]float32
+	var globalScratch [131072]byte
 
 	for {
 		n, err := unix.EpollWait(epfd, events, -1)
@@ -524,73 +514,66 @@ func main() {
 				for _, client_fd := range fds {
 					unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 					unix.SetNonblock(client_fd, true)
-					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+					
+					rn, err := unix.Read(client_fd, buf)
+					if err == nil && rn > 0 {
+						processInline(client_fd, buf[:rn], &globalQuery, &globalScratch)
+					} else {
+						unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+					}
 				}
 				continue
 			}
 
 			// Client socket
 			rn, err := unix.Read(fd, buf)
-			if err != nil {
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-					continue
+			if err != nil || rn <= 0 {
+				if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+					unix.Close(fd)
 				}
-				unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
-				unix.Close(fd)
-				continue
-			}
-			if rn <= 0 {
-				unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
-				unix.Close(fd)
 				continue
 			}
 
-			atomic.AddUint64(&reqCount, 1)
-			data := buf[:rn]
-
-			if bytes.HasPrefix(data, []byte("GET /ready")) {
-				unix.Write(fd, respReady)
-			} else if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
-				bodyIdx := bytes.Index(data, []byte("\r\n\r\n"))
-				if bodyIdx != -1 {
-					body := data[bodyIdx+4:]
-					q := queryPool.Get().(*[14]float32)
-					
-					fastVectorize(body, q)
-
-					scratch := scratchPool.Get().(*[]byte)
-					frauds := engine.SearchVectorFast(&q[0], &(*scratch)[0])
-					scratchPool.Put(scratch)
-					
-					queryPool.Put(q)
-
-					switch frauds {
-					case 0:
-						unix.Write(fd, resp0)
-					case 1:
-						unix.Write(fd, resp1)
-					case 2:
-						unix.Write(fd, resp2)
-					case 3:
-						unix.Write(fd, resp3)
-					case 4:
-						unix.Write(fd, resp4)
-					case 5:
-						unix.Write(fd, resp5)
-					default:
-						// Em vez de retornar um falso negativo (fallback silencioso cego),
-						// tenta manter a estabilidade. O ideal é retornar fallback com log se frauds < 0
-						unix.Write(fd, resp3)
-					}
-				} else {
-					unix.Write(fd, resp404)
-				}
-			} else {
-				unix.Write(fd, resp404)
-			}
-
-			unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
-			unix.Close(fd)
+			processInline(fd, buf[:rn], &globalQuery, &globalScratch)
 		}
 	}
+}
+
+func processInline(fd int, data []byte, q *[14]float32, scratch *[131072]byte) {
+	atomic.AddUint64(&reqCount, 1)
+
+	if bytes.HasPrefix(data, []byte("GET /ready")) {
+		unix.Write(fd, respReady)
+	} else if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
+		bodyIdx := bytes.Index(data, []byte("\r\n\r\n"))
+		if bodyIdx != -1 {
+			body := data[bodyIdx+4:]
+			
+			fastVectorize(body, q)
+			frauds := engine.SearchVectorFast(&q[0], &scratch[0])
+
+			switch frauds {
+			case 0:
+				unix.Write(fd, resp0)
+			case 1:
+				unix.Write(fd, resp1)
+			case 2:
+				unix.Write(fd, resp2)
+			case 3:
+				unix.Write(fd, resp3)
+			case 4:
+				unix.Write(fd, resp4)
+			case 5:
+				unix.Write(fd, resp5)
+			default:
+				unix.Write(fd, resp3)
+			}
+		} else {
+			unix.Write(fd, resp404)
+		}
+	} else {
+		unix.Write(fd, resp404)
+	}
+
+	unix.Close(fd)
 }
