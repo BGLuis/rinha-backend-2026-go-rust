@@ -23,6 +23,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/buger/jsonparser"
 	"golang.org/x/sys/unix"
 	"rinha-api/engine"
 )
@@ -129,6 +130,23 @@ var (
 	keyTimestamp    = []byte(`"timestamp"`)
 	keyKmCurr       = []byte(`"km_from_current"`)
 )
+
+var jsonPaths = [][]string{
+	{"transaction", "amount"},
+	{"transaction", "installments"},
+	{"transaction", "requested_at"},
+	{"merchant", "id"},
+	{"merchant", "mcc"},
+	{"merchant", "avg_amount"},
+	{"customer", "avg_amount"},
+	{"customer", "tx_count_24h"},
+	{"customer", "known_merchants"},
+	{"terminal", "is_online"},
+	{"terminal", "card_present"},
+	{"terminal", "km_from_home"},
+	{"last_transaction", "timestamp"},
+	{"last_transaction", "km_from_current"},
+}
 
 func parseFloatFast(b []byte, start int) (float64, int) {
 	var val float64
@@ -301,42 +319,33 @@ func fastParseTimeStr(s []byte) int64 {
 }
 
 func fastVectorize(body []byte, q *[14]float32) {
-	txBlock := getBlock(body, keyTx)
-	amt := getValFloat(txBlock, keyAmount)
-	inst := getValInt(txBlock, keyInst)
-	reqAtBytes := getValString(txBlock, keyReqAt)
+	var amt, mAvgAmt, cAvgAmt, kmHome, kmLast float64
+	var inst, txCount int64
+	var reqAtBytes, merchId, mccBytes, knownMerchBlock, lastTsBytes []byte
+	var isOnline, cardPresent, hasLastTx bool
 
-	custBlock := getBlock(body, keyCust)
-	cAvgAmt := getValFloat(custBlock, keyAvgAmount)
-	txCount := getValInt(custBlock, keyTxCount)
-	knownMerchStart := findValStart(custBlock, keyKnownMerch)
-	var knownMerchBlock []byte
-	if knownMerchStart != -1 && knownMerchStart < len(custBlock) && custBlock[knownMerchStart] == '[' {
-		end := bytes.IndexByte(custBlock[knownMerchStart:], ']')
-		if end != -1 {
-			knownMerchBlock = custBlock[knownMerchStart : knownMerchStart+end+1]
+	jsonparser.EachKey(body, func(idx int, value []byte, vt jsonparser.ValueType, err error) {
+		switch idx {
+		case 0: amt, _ = parseFloatFast(value, 0)
+		case 1: inst, _ = parseIntFast(value, 0)
+		case 2: reqAtBytes = value
+		case 3: merchId = value
+		case 4: mccBytes = value
+		case 5: mAvgAmt, _ = parseFloatFast(value, 0)
+		case 6: cAvgAmt, _ = parseFloatFast(value, 0)
+		case 7: txCount, _ = parseIntFast(value, 0)
+		case 8: knownMerchBlock = value
+		case 9: isOnline, _ = parseBoolFast(value, 0)
+		case 10: cardPresent, _ = parseBoolFast(value, 0)
+		case 11: kmHome, _ = parseFloatFast(value, 0)
+		case 12: 
+			hasLastTx = true
+			lastTsBytes = value
+		case 13: 
+			hasLastTx = true
+			kmLast, _ = parseFloatFast(value, 0)
 		}
-	}
-
-	merchBlock := getBlock(body, keyMerch)
-	merchId := getValString(merchBlock, keyId)
-	mccBytes := getValString(merchBlock, keyMcc)
-	mAvgAmt := getValFloat(merchBlock, keyAvgAmount)
-
-	termBlock := getBlock(body, keyTerm)
-	isOnline := getValBool(termBlock, keyIsOnline)
-	cardPresent := getValBool(termBlock, keyCardPres)
-	kmHome := getValFloat(termBlock, keyKmHome)
-
-	lastTxBlock := getBlock(body, keyLastTx)
-	var lastTsBytes []byte
-	var kmLast float64
-	hasLastTx := false
-	if len(lastTxBlock) > 0 {
-		hasLastTx = true
-		lastTsBytes = getValString(lastTxBlock, keyTimestamp)
-		kmLast = getValFloat(lastTxBlock, keyKmCurr)
-	}
+	}, jsonPaths...)
 
 	known := false
 	if len(knownMerchBlock) > 0 && len(merchId) > 0 {
