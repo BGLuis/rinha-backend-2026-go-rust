@@ -107,12 +107,7 @@ func clamp(v float64) float32 {
 	return float32(v)
 }
 
-func round4(v float32) float32 {
-	if v == -1 {
-		return -1
-	}
-	return float32(math.Round(float64(v)*10000) / 10000)
-}
+
 
 var (
 	keyTx           = []byte(`"transaction"`)
@@ -363,15 +358,15 @@ func fastVectorize(body []byte, q *[14]float32) {
 		reqWeekday += 7
 	}
 
-	q[0] = round4(clamp(amt / MaxAmount))
-	q[1] = round4(clamp(float64(inst) / MaxInstallments))
+	q[0] = clamp(amt / MaxAmount)
+	q[1] = clamp(float64(inst) / MaxInstallments)
 	if cAvgAmt > 0 {
-		q[2] = round4(clamp((amt / cAvgAmt) / AmountVsAvgRatio))
+		q[2] = clamp((amt / cAvgAmt) / AmountVsAvgRatio)
 	} else {
 		q[2] = 1.0
 	}
-	q[3] = round4(float32(reqHour) / 23.0)
-	q[4] = round4(float32(reqWeekday) / 6.0)
+	q[3] = float32(reqHour) / 23.0
+	q[4] = float32(reqWeekday) / 6.0
 
 	if !hasLastTx || len(lastTsBytes) == 0 {
 		q[5] = -1.0
@@ -379,12 +374,12 @@ func fastVectorize(body []byte, q *[14]float32) {
 	} else {
 		lastTsUnix := fastParseTimeStr(lastTsBytes)
 		minutes := float64(reqAtUnix-lastTsUnix) / 60.0
-		q[5] = round4(clamp(minutes / MaxMinutes))
-		q[6] = round4(clamp(kmLast / MaxKm))
+		q[5] = clamp(minutes / MaxMinutes)
+		q[6] = clamp(kmLast / MaxKm)
 	}
 
-	q[7] = round4(clamp(kmHome / MaxKm))
-	q[8] = round4(clamp(float64(txCount) / MaxTxCount24h))
+	q[7] = clamp(kmHome / MaxKm)
+	q[8] = clamp(float64(txCount) / MaxTxCount24h)
 	if isOnline {
 		q[9] = 1.0
 	} else {
@@ -408,11 +403,11 @@ func fastVectorize(body []byte, q *[14]float32) {
 		}
 	}
 	if m < 10000 {
-		q[12] = round4(MccRiskArr[m])
+		q[12] = MccRiskArr[m]
 	} else {
 		q[12] = 0.5
 	}
-	q[13] = round4(clamp(mAvgAmt / MaxMerchantAvgAmount))
+	q[13] = clamp(mAvgAmt / MaxMerchantAvgAmount)
 }
 
 var reqCount uint64

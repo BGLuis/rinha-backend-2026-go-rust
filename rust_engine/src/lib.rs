@@ -12,6 +12,9 @@ static mut OFFSETS: Option<&'static [u32]> = None;
 static mut NUM_BLOCKS: Option<&'static [u32]> = None;
 static mut NUM_CLUSTERS: usize = 0;
 
+static mut SUPER_CENTROIDS: Option<Vec<[i16; 16]>> = None;
+static mut SUPER_INDEX: Option<Vec<Vec<usize>>> = None;
+
 #[no_mangle]
 pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
     unsafe {
@@ -59,6 +62,51 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         NUM_BLOCKS = Some(slice::from_raw_parts(num_blocks_ptr, k));
 
         MMAP_PTR = Some(ptr as *const u8);
+
+        // Build Two-Tier IVF (Super-Centroids) for O(sqrt N) search
+        let num_super = 91;
+        let mut super_centroids = vec![[0i16; 16]; num_super];
+        for i in 0..num_super {
+            super_centroids[i] = centroids[i * (k / num_super)];
+        }
+        
+        let mut assignment = vec![0; k];
+        for _ in 0..5 {
+            let mut sums = vec![[0i32; 16]; num_super];
+            let mut counts = vec![0; num_super];
+            for i in 0..k {
+                let mut best_d = i32::MAX;
+                let mut best_s = 0;
+                let c_vec = _mm256_loadu_si256(centroids[i].as_ptr() as *const __m256i);
+                for s in 0..num_super {
+                    let d = dist_avx2_i16(c_vec, super_centroids[s].as_ptr());
+                    if d < best_d {
+                        best_d = d;
+                        best_s = s;
+                    }
+                }
+                assignment[i] = best_s;
+                counts[best_s] += 1;
+                for j in 0..16 {
+                    sums[best_s][j] += centroids[i][j] as i32;
+                }
+            }
+            for s in 0..num_super {
+                if counts[s] > 0 {
+                    for j in 0..16 {
+                        super_centroids[s][j] = (sums[s][j] / counts[s]) as i16;
+                    }
+                }
+            }
+        }
+        
+        let mut super_index = vec![Vec::with_capacity(k / num_super * 2); num_super];
+        for i in 0..k {
+            super_index[assignment[i]].push(i);
+        }
+        
+        SUPER_CENTROIDS = Some(super_centroids);
+        SUPER_INDEX = Some(super_index);
 
         // Warmup: Synthetic searches to train BPU and L3 Cache
         let dummy_query = [0.0f32; 14];
@@ -185,11 +233,27 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
 
     let q_vec = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
 
-    let mut centroid_dists = [(0i32, 0usize); 8192];
-    let n_centroids = std::cmp::min(num_k, 8192);
+    let super_centroids = SUPER_CENTROIDS.as_ref().unwrap();
+    let super_index = SUPER_INDEX.as_ref().unwrap();
+
+    let mut super_dists = [(0i32, 0usize); 91];
+    for s in 0..91 {
+        super_dists[s] = (dist_avx2_i16(q_vec, super_centroids[s].as_ptr()), s);
+    }
+    super_dists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut centroid_dists = [(0i32, 0usize); 2048];
+    let mut n_candidates = 0;
     
-    for i in 0..n_centroids {
-        centroid_dists[i] = (dist_avx2_i16(q_vec, centroids[i].as_ptr()), i);
+    // Probe top 8 super-centroids (approx 8 * 90 = 720 centroids out of 8192)
+    for s in 0..8 {
+        let s_idx = super_dists[s].1;
+        for &ki in &super_index[s_idx] {
+            if n_candidates < 2048 {
+                centroid_dists[n_candidates] = (dist_avx2_i16(q_vec, centroids[ki].as_ptr()), ki);
+                n_candidates += 1;
+            }
+        }
     }
 
     let mut top_dists = [i32::MAX; 5];
@@ -198,16 +262,16 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
 
     let nprobe = 128;
     
-    if n_centroids <= nprobe {
-        let sub = &mut centroid_dists[0..n_centroids];
+    if n_candidates <= nprobe {
+        let sub = &mut centroid_dists[0..n_candidates];
         sub.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for i in 0..n_centroids {
+        for i in 0..n_candidates {
             let ki = sub[i].1;
             if min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()) >= top_dists[4] { continue; }
             scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
         }
     } else {
-        let (sub_initial, _, rest) = centroid_dists[0..n_centroids].select_nth_unstable_by(nprobe, |a, b| a.0.cmp(&b.0));
+        let (sub_initial, _, rest) = centroid_dists[0..n_candidates].select_nth_unstable_by(nprobe, |a, b| a.0.cmp(&b.0));
         sub_initial.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         
         for i in 0..nprobe {
