@@ -267,12 +267,13 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     }
     super_dists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+    let mut child_dists = [(0i32, 0usize); 128]; // max count is around 90, so 128 is enough
+
     for s in 0..91 {
         if super_dists[s].0 >= top_dists[4] { break; } // Exact pruning at Super-BBox level
         let s_idx = super_dists[s].1;
         
         let count = super_index[s_idx].len();
-        let mut child_dists = [(0i32, 0usize); 512]; // max possible size to prevent overflow
         for i in 0..count {
             let ki = super_index[s_idx][i];
             child_dists[i] = (min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()), ki);
