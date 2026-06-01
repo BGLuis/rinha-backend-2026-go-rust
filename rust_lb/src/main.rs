@@ -53,6 +53,8 @@ fn main() -> std::io::Result<()> {
 
     println!("Fallback LB started with pure epoll on port {}", port);
 
+    let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(64); up_addrs.len()];
+
     loop {
         let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, -1) };
         if n < 0 {
@@ -63,7 +65,9 @@ fn main() -> std::io::Result<()> {
             return Err(err);
         }
 
-        let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(64); up_addrs.len()];
+        for b in &mut batches {
+            b.clear();
+        }
 
         for i in 0..n {
             if events[i as usize].u64 == listen_fd as u64 {
@@ -131,6 +135,7 @@ fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
     unsafe {
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
         let mut addr: libc::sockaddr_in = mem::zeroed();
         addr.sin_family = libc::AF_INET as libc::sa_family_t;
         addr.sin_port = port.to_be();

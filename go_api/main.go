@@ -519,6 +519,7 @@ func main() {
 				}
 
 				for _, client_fd := range fds {
+					unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 					unix.SetNonblock(client_fd, true)
 					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
 				}
