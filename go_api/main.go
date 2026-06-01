@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
-	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
