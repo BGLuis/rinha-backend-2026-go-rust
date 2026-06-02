@@ -13,6 +13,7 @@ import "C"
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log"
 	"os"
 	"runtime"
@@ -412,6 +413,37 @@ func main() {
 	datasetPath := os.Getenv("DATASET_PATH")
 	if datasetPath == "" {
 		datasetPath = "dataset.bin"
+	}
+
+	sharedDatasetPath := os.Getenv("SHARED_DATASET_PATH")
+	if sharedDatasetPath != "" {
+		if os.Getenv("SOCKET_PATH") == "/tmp/sockets/api1.sock" {
+			if _, err := os.Stat(sharedDatasetPath); os.IsNotExist(err) {
+				tmpPath := sharedDatasetPath + ".tmp"
+				src, err := os.Open(datasetPath)
+				if err == nil {
+					dst, err2 := os.Create(tmpPath)
+					if err2 == nil {
+						_, errCopy := io.Copy(dst, src)
+						dst.Close()
+						if errCopy == nil {
+							os.Rename(tmpPath, sharedDatasetPath)
+						} else {
+							log.Printf("copy error: %v", errCopy)
+						}
+					}
+					src.Close()
+				}
+			}
+		} else {
+			for {
+				if _, err := os.Stat(sharedDatasetPath); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		datasetPath = sharedDatasetPath
 	}
 
 	cPath := C.CString(datasetPath)
