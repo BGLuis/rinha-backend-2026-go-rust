@@ -280,7 +280,7 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     }
     super_dists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let mut child_dists = [(0i32, 0usize); 128]; // max count is around 90, so 128 is enough
+    let mut child_dists = [(0i32, 0usize); 4096]; // safely hold up to NUM_CLUSTERS
 
     for s in 0..91 {
         if super_dists[s].0 >= top_dists[4] { break; } // Exact pruning at Super-BBox level

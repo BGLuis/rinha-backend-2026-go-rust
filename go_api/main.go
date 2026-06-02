@@ -40,15 +40,14 @@ var (
 var MccRiskArr [10000]float32
 
 var (
-	resp0 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
-	resp1 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
-	resp2 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
-	resp3 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
-	resp4 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
-	resp5 = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
-
-	respReady = []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
-	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	resp0     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
+	resp1     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
+	resp2     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
+	resp3     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
+	resp4     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
+	resp5     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
+	resp404   = []byte("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+	respReady = []byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
 )
 
 func loadConfig() {
@@ -182,7 +181,23 @@ func parseStringFast(b []byte, start int) ([]byte, int) {
 	return nil, len(b)
 }
 
-func findValStart(b []byte, key []byte) int {
+func findAfter(b []byte, blockKey, valKey []byte) int {
+	bIdx := bytes.Index(b, blockKey)
+	if bIdx == -1 {
+		return -1
+	}
+	vIdx := bytes.Index(b[bIdx:], valKey)
+	if vIdx == -1 {
+		return -1
+	}
+	start := bIdx + vIdx + len(valKey)
+	for start < len(b) && (b[start] == ' ' || b[start] == ':' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	return start
+}
+
+func findDirect(b []byte, key []byte) int {
 	idx := bytes.Index(b, key)
 	if idx == -1 {
 		return -1
@@ -194,35 +209,7 @@ func findValStart(b []byte, key []byte) int {
 	return start
 }
 
-func getBlock(b []byte, key []byte) []byte {
-	idx := bytes.Index(b, key)
-	if idx == -1 {
-		return nil
-	}
-	start := idx + len(key)
-	for start < len(b) && b[start] != '{' && b[start] != 'n' {
-		start++
-	}
-	if start < len(b) && b[start] == 'n' {
-		return nil
-	}
-	depth := 0
-	for i := start; i < len(b); i++ {
-		if b[i] == '{' {
-			depth++
-		}
-		if b[i] == '}' {
-			depth--
-			if depth == 0 {
-				return b[start : i+1]
-			}
-		}
-	}
-	return b[start:]
-}
-
-func getValFloat(b []byte, key []byte) float64 {
-	start := findValStart(b, key)
+func getValFloat(b []byte, start int) float64 {
 	if start == -1 {
 		return 0
 	}
@@ -230,8 +217,7 @@ func getValFloat(b []byte, key []byte) float64 {
 	return f
 }
 
-func getValInt(b []byte, key []byte) int64 {
-	start := findValStart(b, key)
+func getValInt(b []byte, start int) int64 {
 	if start == -1 {
 		return 0
 	}
@@ -239,8 +225,7 @@ func getValInt(b []byte, key []byte) int64 {
 	return v
 }
 
-func getValBool(b []byte, key []byte) bool {
-	start := findValStart(b, key)
+func getValBool(b []byte, start int) bool {
 	if start == -1 {
 		return false
 	}
@@ -248,8 +233,7 @@ func getValBool(b []byte, key []byte) bool {
 	return v
 }
 
-func getValString(b []byte, key []byte) []byte {
-	start := findValStart(b, key)
+func getValString(b []byte, start int) []byte {
 	if start == -1 {
 		return nil
 	}
@@ -295,41 +279,44 @@ func fastParseTimeStr(s []byte) int64 {
 }
 
 func fastVectorize(body []byte, q *[14]float32) {
-	txBlock := getBlock(body, keyTx)
-	amt := getValFloat(txBlock, keyAmount)
-	inst := getValInt(txBlock, keyInst)
-	reqAtBytes := getValString(txBlock, keyReqAt)
+	amt := getValFloat(body, findDirect(body, keyAmount))
+	inst := getValInt(body, findDirect(body, keyInst))
+	reqAtBytes := getValString(body, findDirect(body, keyReqAt))
 
-	custBlock := getBlock(body, keyCust)
-	cAvgAmt := getValFloat(custBlock, keyAvgAmount)
-	txCount := getValInt(custBlock, keyTxCount)
-	knownMerchStart := findValStart(custBlock, keyKnownMerch)
+	cAvgAmt := getValFloat(body, findAfter(body, keyCust, keyAvgAmount))
+	txCount := getValInt(body, findDirect(body, keyTxCount))
+	
+	knownMerchStart := findDirect(body, keyKnownMerch)
 	var knownMerchBlock []byte
-	if knownMerchStart != -1 && knownMerchStart < len(custBlock) && custBlock[knownMerchStart] == '[' {
-		end := bytes.IndexByte(custBlock[knownMerchStart:], ']')
+	if knownMerchStart != -1 && knownMerchStart < len(body) && body[knownMerchStart] == '[' {
+		end := bytes.IndexByte(body[knownMerchStart:], ']')
 		if end != -1 {
-			knownMerchBlock = custBlock[knownMerchStart : knownMerchStart+end+1]
+			knownMerchBlock = body[knownMerchStart : knownMerchStart+end+1]
 		}
 	}
 
-	merchBlock := getBlock(body, keyMerch)
-	merchId := getValString(merchBlock, keyId)
-	mccBytes := getValString(merchBlock, keyMcc)
-	mAvgAmt := getValFloat(merchBlock, keyAvgAmount)
+	merchId := getValString(body, findAfter(body, keyMerch, keyId))
+	mccBytes := getValString(body, findDirect(body, keyMcc))
+	mAvgAmt := getValFloat(body, findAfter(body, keyMerch, keyAvgAmount))
 
-	termBlock := getBlock(body, keyTerm)
-	isOnline := getValBool(termBlock, keyIsOnline)
-	cardPresent := getValBool(termBlock, keyCardPres)
-	kmHome := getValFloat(termBlock, keyKmHome)
+	isOnline := getValBool(body, findDirect(body, keyIsOnline))
+	cardPresent := getValBool(body, findDirect(body, keyCardPres))
+	kmHome := getValFloat(body, findDirect(body, keyKmHome))
 
-	lastTxBlock := getBlock(body, keyLastTx)
 	var lastTsBytes []byte
 	var kmLast float64
 	hasLastTx := false
-	if len(lastTxBlock) > 0 {
-		hasLastTx = true
-		lastTsBytes = getValString(lastTxBlock, keyTimestamp)
-		kmLast = getValFloat(lastTxBlock, keyKmCurr)
+	
+	lastTxStart := bytes.Index(body, keyLastTx)
+	if lastTxStart != -1 {
+		nullIdx := bytes.Index(body[lastTxStart:], []byte("null"))
+		timeStart := findAfter(body[lastTxStart:], keyLastTx, keyTimestamp)
+		
+		if timeStart != -1 && (nullIdx == -1 || timeStart < nullIdx) {
+			hasLastTx = true
+			lastTsBytes = getValString(body[lastTxStart:], timeStart)
+			kmLast = getValFloat(body[lastTxStart:], findAfter(body[lastTxStart:], keyLastTx, keyKmCurr))
+		}
 	}
 
 	known := false
@@ -534,8 +521,6 @@ func main() {
 				}
 
 				for _, client_fd := range fds {
-					unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
-					unix.SetNonblock(client_fd, true)
 					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
 				}
 				continue
@@ -585,8 +570,6 @@ func main() {
 					case 5:
 						unix.Write(fd, resp5)
 					default:
-						// Em vez de retornar um falso negativo (fallback silencioso cego),
-						// tenta manter a estabilidade. O ideal é retornar fallback com log se frauds < 0
 						unix.Write(fd, resp3)
 					}
 				} else {
