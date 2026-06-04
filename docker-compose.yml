@@ -15,8 +15,8 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        cpus: '0.45'
-        memory: '150M'
+        cpus: '0.70'
+        memory: '200M'
 
 services:
   lb:
@@ -55,7 +55,7 @@ services:
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
       - SHARED_DATASET_PATH=/shared/dataset.bin
-      - GOMEMLIMIT=130MiB
+      - GOMEMLIMIT=180MiB
       - GOGC=1000
 
   api2:
@@ -64,7 +64,7 @@ services:
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
       - SHARED_DATASET_PATH=/shared/dataset.bin
-      - GOMEMLIMIT=130MiB
+      - GOMEMLIMIT=180MiB
       - GOGC=1000
 
 #   warmup:
