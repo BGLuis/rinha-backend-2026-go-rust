@@ -2,6 +2,7 @@ x-api-common: &api-common
   build: .
   volumes:
     - shared_sockets:/tmp/sockets
+    - shared_dataset:/shared
   networks:
     - rinha-net
   ulimits:
@@ -53,6 +54,7 @@ services:
     restart: always
     environment:
       - SOCKET_PATH=/tmp/sockets/api1.sock
+      - SHARED_DATASET_PATH=/shared/dataset.bin
       - GOMEMLIMIT=130MiB
       - GOGC=1000
 
@@ -61,6 +63,7 @@ services:
     restart: always
     environment:
       - SOCKET_PATH=/tmp/sockets/api2.sock
+      - SHARED_DATASET_PATH=/shared/dataset.bin
       - GOMEMLIMIT=130MiB
       - GOGC=1000
 
@@ -91,6 +94,12 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
+  shared_dataset:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=150m"
 
 networks:
   rinha-net:

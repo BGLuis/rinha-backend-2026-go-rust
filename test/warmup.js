@@ -18,7 +18,7 @@ export default function () {
     const entry = testData[idx];
 
     http.post(
-        'http://localhost:9999/fraud-score',
+        `${__ENV.BASE_URL}/fraud-score`,
         JSON.stringify(entry.request),
         { headers: { 'Content-Type': 'application/json' }, timeout: '2s' }
     );

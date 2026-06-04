@@ -65,13 +65,13 @@ func loadConfig() {
 		MaxMerchantAvgAmount float64 `json:"max_merchant_avg_amount"`
 	}
 	json.Unmarshal(normData, &norm)
-	MaxAmount = norm.MaxAmount
-	MaxInstallments = norm.MaxInstallments
-	AmountVsAvgRatio = norm.AmountVsAvgRatio
-	MaxMinutes = norm.MaxMinutes
-	MaxKm = norm.MaxKm
-	MaxTxCount24h = norm.MaxTxCount24h
-	MaxMerchantAvgAmount = norm.MaxMerchantAvgAmount
+	MaxAmount = 1.0 / norm.MaxAmount
+	MaxInstallments = 1.0 / norm.MaxInstallments
+	AmountVsAvgRatio = 1.0 / norm.AmountVsAvgRatio
+	MaxMinutes = 1.0 / norm.MaxMinutes
+	MaxKm = 1.0 / norm.MaxKm
+	MaxTxCount24h = 1.0 / norm.MaxTxCount24h
+	MaxMerchantAvgAmount = 1.0 / norm.MaxMerchantAvgAmount
 
 	for i := range MccRiskArr {
 		MccRiskArr[i] = 0.5
@@ -338,10 +338,10 @@ func fastVectorize(body []byte, q *[14]float32) {
 		reqWeekday += 7
 	}
 
-	q[0] = clamp(amt / MaxAmount)
-	q[1] = clamp(float64(inst) / MaxInstallments)
+	q[0] = clamp(amt * MaxAmount)
+	q[1] = clamp(float64(inst) * MaxInstallments)
 	if cAvgAmt > 0 {
-		q[2] = clamp((amt / cAvgAmt) / AmountVsAvgRatio)
+		q[2] = clamp((amt / cAvgAmt) * AmountVsAvgRatio)
 	} else {
 		q[2] = 1.0
 	}
@@ -354,12 +354,12 @@ func fastVectorize(body []byte, q *[14]float32) {
 	} else {
 		lastTsUnix := fastParseTimeStr(lastTsBytes)
 		minutes := float64(reqAtUnix-lastTsUnix) / 60.0
-		q[5] = clamp(minutes / MaxMinutes)
-		q[6] = clamp(kmLast / MaxKm)
+		q[5] = clamp(minutes * MaxMinutes)
+		q[6] = clamp(kmLast * MaxKm)
 	}
 
-	q[7] = clamp(kmHome / MaxKm)
-	q[8] = clamp(float64(txCount) / MaxTxCount24h)
+	q[7] = clamp(kmHome * MaxKm)
+	q[8] = clamp(float64(txCount) * MaxTxCount24h)
 	if isOnline {
 		q[9] = 1.0
 	} else {
@@ -387,7 +387,7 @@ func fastVectorize(body []byte, q *[14]float32) {
 	} else {
 		q[12] = 0.5
 	}
-	q[13] = clamp(mAvgAmt / MaxMerchantAvgAmount)
+	q[13] = clamp(mAvgAmt * MaxMerchantAvgAmount)
 }
 
 var reqCount uint64
