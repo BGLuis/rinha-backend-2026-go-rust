@@ -26,5 +26,5 @@ Thumbs.db
 
 # Ignore results
 test/results.json
-test/results_precision.json
+test/results_*.json
 

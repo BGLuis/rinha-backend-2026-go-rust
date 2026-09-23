@@ -6,7 +6,7 @@ package main
 #include <stdlib.h>
 
 int32_t init_engine(const char* path);
-int32_t search_vector(const float* query, int32_t force_deep);
+int32_t search_vector(const int16_t* query, int32_t force_deep);
 */
 import "C"
 
@@ -37,14 +37,16 @@ func main() {
 	defer pprof.StopCPUProfile()
 
 	rng := rand.New(rand.NewSource(42))
-	var q [14]float32
+	var q [16]int16
 
 	// Run 50000 synthetic searches to build a representative profile
 	for i := 0; i < 50000; i++ {
 		for j := 0; j < 14; j++ {
-			q[j] = rng.Float32()
+			q[j] = int16(rng.Intn(10000))
 		}
-		C.search_vector((*C.float)(unsafe.Pointer(&q[0])), 0)
+		q[14] = 0
+		q[15] = 0
+		C.search_vector((*C.int16_t)(unsafe.Pointer(&q[0])), 0)
 	}
 
 	log.Println("PGO profile collected: cpu.pprof")

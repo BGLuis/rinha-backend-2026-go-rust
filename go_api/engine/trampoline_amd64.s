@@ -1,10 +1,10 @@
 #include "textflag.h"
 
 // Bridge from Go ABI to C ABI System V AMD64
-// func SearchVectorFast(q *float32, scratch *byte) int32
+// func SearchVectorFast(q *int16, scratch *byte) int32
 TEXT ·SearchVectorFast(SB), NOSPLIT, $128-20
     // Go places arguments on the stack (ABI0)
-    MOVQ q+0(FP), DI         // arg 1: *float32 -> RDI
+    MOVQ q+0(FP), DI         // arg 1: *int16 -> RDI
     XORL SI, SI              // arg 2: int32 -> ESI (force_deep = 0)
 
     // Switch SP to the top of the scratch buffer (128KB) to avoid Go stack overflow

@@ -6,7 +6,7 @@ package main
 #include <stdlib.h>
 
 int32_t init_engine(const char* path);
-int32_t search_vector(const float* query, int32_t force_deep);
+int32_t search_vector(const int16_t* query, int32_t force_deep);
 */
 import "C"
 
@@ -242,18 +242,26 @@ func getValString(b []byte, start int) []byte {
 	return v
 }
 
+func clampI16(v float64) int16 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 1.0 {
+		return 10000
+	}
+	return int16(v*10000.0 + 0.5)
+}
+
 func fastParseTimeStr(s []byte) int64 {
 	if len(s) < 19 {
 		return 0
 	}
-	d2 := func(i int) int { return int(s[i]-'0')*10 + int(s[i+1]-'0') }
-
 	year := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
-	month := d2(5)
-	day := d2(8)
-	hour := d2(11)
-	min := d2(14)
-	sec := d2(17)
+	month := int(s[5]-'0')*10 + int(s[6]-'0')
+	day := int(s[8]-'0')*10 + int(s[9]-'0')
+	hour := int(s[11]-'0')*10 + int(s[12]-'0')
+	min := int(s[14]-'0')*10 + int(s[15]-'0')
+	sec := int(s[17]-'0')*10 + int(s[18]-'0')
 
 	y := year
 	if month <= 2 {
@@ -275,90 +283,159 @@ func fastParseTimeStr(s []byte) int64 {
 	doy := (153*m+2)/5 + day - 1
 	doe := yoe*365 + yoe/4 - yoe/100 + doy
 	days := int64(era)*146097 + int64(doe) - 719468
-	
+
 	return days*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
 }
 
-func fastVectorize(body []byte, q *[14]float32) {
-	// 1. Transaction block
-	txStart := bytes.Index(body, keyTx)
-	var amt float64
-	var inst int64
-	var reqAtBytes []byte
-	if txStart != -1 {
-		txBlock := body[txStart:]
-		amt = getValFloat(txBlock, findDirect(txBlock, keyAmount))
-		inst = getValInt(txBlock, findDirect(txBlock, keyInst))
-		reqAtBytes = getValString(txBlock, findDirect(txBlock, keyReqAt))
-	}
+func fastVectorize(body []byte, q *[16]int16) {
+	var (
+		amt, inst                                   float64
+		reqAtUnix                                   int64
+		cAvgAmt, txCount                            float64
+		mAvgAmt                                     float64
+		mccCode                                     int
+		isOnline, cardPresent                       bool
+		kmHome, kmLast                              float64
+		hasLastTx                                   bool
+		lastTsUnix                                  int64
+		known                                       bool
+		merchIdStart, merchIdLen                    int
+		knownMerchStart, knownMerchLen              int
+	)
 
-	// 2. Customer block
-	custStart := bytes.Index(body, keyCust)
-	var cAvgAmt float64
-	var txCount int64
-	var knownMerchBlock []byte
-	if custStart != -1 {
-		custBlock := body[custStart:]
-		cAvgAmt = getValFloat(custBlock, findDirect(custBlock, keyAvgAmount))
-		txCount = getValInt(custBlock, findDirect(custBlock, keyTxCount))
+	L := len(body)
+	i := 0
+	for i < L {
+		if body[i] != '"' {
+			i++
+			continue
+		}
+		i++ // skip open quote
+		kStart := i
+		for i < L && body[i] != '"' {
+			i++
+		}
+		kLen := i - kStart
+		i++ // skip close quote
 
-		knownMerchStart := findDirect(custBlock, keyKnownMerch)
-		if knownMerchStart != -1 && knownMerchStart < len(custBlock) && custBlock[knownMerchStart] == '[' {
-			end := bytes.IndexByte(custBlock[knownMerchStart:], ']')
-			if end != -1 {
-				knownMerchBlock = custBlock[knownMerchStart : knownMerchStart+end+1]
+		for i < L && (body[i] == ':' || body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n') {
+			i++
+		}
+		if i >= L {
+			break
+		}
+
+		vStart := i
+
+		switch kLen {
+		case 2: // id
+			if body[kStart] == 'i' && body[kStart+1] == 'd' {
+				if body[vStart] == '"' {
+					vStart++
+					end := bytes.IndexByte(body[vStart:], '"')
+					if end != -1 {
+						merchIdStart = vStart
+						merchIdLen = end
+						i = vStart + end + 1
+					}
+				}
+			}
+		case 3: // mcc
+			if body[kStart] == 'm' && body[kStart+1] == 'c' {
+				if body[vStart] == '"' {
+					vStart++
+					end := bytes.IndexByte(body[vStart:], '"')
+					if end != -1 {
+						m := 0
+						for p := vStart; p < vStart+end; p++ {
+							if body[p] >= '0' && body[p] <= '9' {
+								m = m*10 + int(body[p]-'0')
+							}
+						}
+						mccCode = m
+						i = vStart + end + 1
+					}
+				}
+			}
+		case 6: // amount
+			if body[kStart] == 'a' && body[kStart+1] == 'm' {
+				amt, i = parseFloatFast(body, vStart)
+			}
+		case 9: // is_online, timestamp
+			if body[kStart] == 'i' { // is_online
+				isOnline, i = parseBoolFast(body, vStart)
+			} else if body[kStart] == 't' { // timestamp
+				if body[vStart] == '"' {
+					vStart++
+					end := bytes.IndexByte(body[vStart:], '"')
+					if end != -1 {
+						lastTsUnix = fastParseTimeStr(body[vStart : vStart+end])
+						hasLastTx = true
+						i = vStart + end + 1
+					}
+				}
+			}
+		case 10: // avg_amount
+			if body[kStart] == 'a' {
+				f, next := parseFloatFast(body, vStart)
+				i = next
+				if cAvgAmt == 0 {
+					cAvgAmt = f
+				} else {
+					mAvgAmt = f
+				}
+			}
+		case 12: // installments, requested_at, tx_count_24h, card_present, km_from_home
+			switch body[kStart] {
+			case 'i': // installments
+				var v int64
+				v, i = parseIntFast(body, vStart)
+				inst = float64(v)
+			case 'r': // requested_at
+				if body[vStart] == '"' {
+					vStart++
+					end := bytes.IndexByte(body[vStart:], '"')
+					if end != -1 {
+						reqAtUnix = fastParseTimeStr(body[vStart : vStart+end])
+						i = vStart + end + 1
+					}
+				}
+			case 't': // tx_count_24h
+				var v int64
+				v, i = parseIntFast(body, vStart)
+				txCount = float64(v)
+			case 'c': // card_present
+				cardPresent, i = parseBoolFast(body, vStart)
+			case 'k': // km_from_home
+				kmHome, i = parseFloatFast(body, vStart)
+			}
+		case 15: // known_merchants, km_from_current
+			if body[kStart] == 'k' {
+				if body[kStart+1] == 'n' { // known_merchants
+					end := bytes.IndexByte(body[vStart:], ']')
+					if end != -1 {
+						knownMerchStart = vStart
+						knownMerchLen = end + 1
+						i = vStart + end + 1
+					}
+				} else { // km_from_current
+					kmLast, i = parseFloatFast(body, vStart)
+				}
+			}
+		case 16: // last_transaction
+			if body[kStart] == 'l' {
+				if body[vStart] == 'n' { // null
+					hasLastTx = false
+					i = vStart + 4
+				}
 			}
 		}
 	}
 
-	// 3. Merchant block
-	merchStart := bytes.Index(body, keyMerch)
-	var merchId []byte
-	var mccBytes []byte
-	var mAvgAmt float64
-	if merchStart != -1 {
-		merchBlock := body[merchStart:]
-		merchId = getValString(merchBlock, findDirect(merchBlock, keyId))
-		mccBytes = getValString(merchBlock, findDirect(merchBlock, keyMcc))
-		mAvgAmt = getValFloat(merchBlock, findDirect(merchBlock, keyAvgAmount))
+	if knownMerchLen > 0 && merchIdLen > 0 {
+		known = bytes.Contains(body[knownMerchStart:knownMerchStart+knownMerchLen], body[merchIdStart:merchIdStart+merchIdLen])
 	}
 
-	// 4. Terminal block
-	termStart := bytes.Index(body, keyTerm)
-	var isOnline bool
-	var cardPresent bool
-	var kmHome float64
-	if termStart != -1 {
-		termBlock := body[termStart:]
-		isOnline = getValBool(termBlock, findDirect(termBlock, keyIsOnline))
-		cardPresent = getValBool(termBlock, findDirect(termBlock, keyCardPres))
-		kmHome = getValFloat(termBlock, findDirect(termBlock, keyKmHome))
-	}
-
-	// 5. Last transaction block
-	var lastTsBytes []byte
-	var kmLast float64
-	hasLastTx := false
-
-	lastTxStart := bytes.Index(body, keyLastTx)
-	if lastTxStart != -1 {
-		lastTxBlock := body[lastTxStart:]
-		nullIdx := bytes.Index(lastTxBlock, []byte("null"))
-		timeStart := findAfter(lastTxBlock, keyLastTx, keyTimestamp)
-
-		if timeStart != -1 && (nullIdx == -1 || timeStart < nullIdx) {
-			hasLastTx = true
-			lastTsBytes = getValString(lastTxBlock, timeStart)
-			kmLast = getValFloat(lastTxBlock, findAfter(lastTxBlock, keyLastTx, keyKmCurr))
-		}
-	}
-
-	known := false
-	if len(knownMerchBlock) > 0 && len(merchId) > 0 {
-		known = bytes.Contains(knownMerchBlock, merchId)
-	}
-
-	reqAtUnix := fastParseTimeStr(reqAtBytes)
 	reqHour := int((reqAtUnix % 86400) / 3600)
 	if reqHour < 0 {
 		reqHour += 24
@@ -372,56 +449,51 @@ func fastVectorize(body []byte, q *[14]float32) {
 		reqWeekday += 7
 	}
 
-	q[0] = clamp(amt * MaxAmount)
-	q[1] = clamp(float64(inst) * MaxInstallments)
+	q[0] = clampI16(amt * MaxAmount)
+	q[1] = clampI16(inst * MaxInstallments)
 	if cAvgAmt > 0 {
-		q[2] = clamp((amt / cAvgAmt) * AmountVsAvgRatio)
+		q[2] = clampI16((amt / cAvgAmt) * AmountVsAvgRatio)
 	} else {
-		q[2] = 1.0
+		q[2] = 10000
 	}
-	q[3] = float32(reqHour) / 23.0
-	q[4] = float32(reqWeekday) / 6.0
+	q[3] = int16((float32(reqHour)/23.0)*10000.0 + 0.5)
+	q[4] = int16((float32(reqWeekday)/6.0)*10000.0 + 0.5)
 
-	if !hasLastTx || len(lastTsBytes) == 0 {
-		q[5] = -1.0
-		q[6] = -1.0
+	if !hasLastTx {
+		q[5] = -10000
+		q[6] = -10000
 	} else {
-		lastTsUnix := fastParseTimeStr(lastTsBytes)
 		minutes := float64(reqAtUnix-lastTsUnix) / 60.0
-		q[5] = clamp(minutes * MaxMinutes)
-		q[6] = clamp(kmLast * MaxKm)
+		q[5] = clampI16(minutes * MaxMinutes)
+		q[6] = clampI16(kmLast * MaxKm)
 	}
 
-	q[7] = clamp(kmHome * MaxKm)
-	q[8] = clamp(float64(txCount) * MaxTxCount24h)
+	q[7] = clampI16(kmHome * MaxKm)
+	q[8] = clampI16(txCount * MaxTxCount24h)
 	if isOnline {
-		q[9] = 1.0
+		q[9] = 10000
 	} else {
-		q[9] = 0.0
+		q[9] = 0
 	}
 	if cardPresent {
-		q[10] = 1.0
+		q[10] = 10000
 	} else {
-		q[10] = 0.0
+		q[10] = 0
 	}
 	if !known {
-		q[11] = 1.0
+		q[11] = 10000
 	} else {
-		q[11] = 0.0
+		q[11] = 0
 	}
 
-	m := 0
-	for _, b := range mccBytes {
-		if b >= '0' && b <= '9' {
-			m = m*10 + int(b-'0')
-		}
-	}
-	if m < 10000 {
-		q[12] = MccRiskArr[m]
+	if mccCode < 10000 {
+		q[12] = int16(MccRiskArr[mccCode]*10000.0 + 0.5)
 	} else {
-		q[12] = 0.5
+		q[12] = 5000
 	}
-	q[13] = clamp(mAvgAmt * MaxMerchantAvgAmount)
+	q[13] = clampI16(mAvgAmt * MaxMerchantAvgAmount)
+	q[14] = 0
+	q[15] = 0
 }
 
 func writeResp(fd int, epfd int, resp []byte) bool {
@@ -434,10 +506,10 @@ func writeResp(fd int, epfd int, resp []byte) bool {
 	return true
 }
 
-func handleRequest(fd int, data []byte, q *[14]float32, scratch *[131072]byte, epfd int) {
+func handleRequest(fd int, data []byte, q *[16]int16, scratch *[131072]byte, epfd int) {
 	var ok bool
 	var bodyIdx int = -1
-	if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
+	if len(data) >= 17 && data[0] == 'P' && data[1] == 'O' && data[2] == 'S' && data[3] == 'T' && data[5] == '/' && data[6] == 'f' {
 		bodyIdx = bytes.Index(data, []byte("\r\n\r\n"))
 		if bodyIdx != -1 {
 			body := data[bodyIdx+4:]
@@ -454,7 +526,7 @@ func handleRequest(fd int, data []byte, q *[14]float32, scratch *[131072]byte, e
 		} else {
 			ok = writeResp(fd, epfd, resp404)
 		}
-	} else if bytes.HasPrefix(data, []byte("GET /ready")) {
+	} else if len(data) >= 10 && data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[4] == '/' && data[5] == 'r' {
 		ok = writeResp(fd, epfd, respReady)
 	} else {
 		ok = writeResp(fd, epfd, resp404)
@@ -464,14 +536,7 @@ func handleRequest(fd int, data []byte, q *[14]float32, scratch *[131072]byte, e
 		return
 	}
 
-	headerPart := data
-	if bodyIdx != -1 {
-		headerPart = data[:bodyIdx]
-	} else if idx := bytes.Index(data, []byte("\r\n\r\n")); idx != -1 {
-		headerPart = data[:idx]
-	}
-
-	if (bytes.IndexByte(headerPart, 'c') != -1 || bytes.IndexByte(headerPart, 'C') != -1) && bytes.Contains(headerPart, []byte("close")) {
+	if bodyIdx != -1 && bytes.Contains(data[:bodyIdx], []byte("close")) {
 		unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
 		unix.Close(fd)
 	}
@@ -566,7 +631,7 @@ func main() {
 	oob := make([]byte, unix.CmsgSpace(16*4))
 	dummy := make([]byte, 1)
 
-	var globalQuery [14]float32
+	var globalQuery [16]int16
 	var globalScratch [131072]byte
 
 	for {
@@ -575,7 +640,7 @@ func main() {
 			continue
 		}
 		if n == 0 && err == nil {
-			for s := 0; s < 500; s++ {
+			for s := 0; s < 1200; s++ {
 				engine.Pause()
 				engine.Pause()
 				n, err = unix.EpollWait(epfd, events, 0)

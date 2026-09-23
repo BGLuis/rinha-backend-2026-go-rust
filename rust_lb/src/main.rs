@@ -58,10 +58,16 @@ fn main() -> std::io::Result<()> {
     loop {
         let mut n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
         if n == 0 {
-            for _ in 0..64 {
-                unsafe { std::arch::x86_64::_mm_pause(); }
+            for _ in 0..300 {
+                unsafe {
+                    std::arch::x86_64::_mm_pause();
+                    std::arch::x86_64::_mm_pause();
+                }
+                n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
+                if n > 0 {
+                    break;
+                }
             }
-            n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
         }
         if n == 0 {
             n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, -1) };
@@ -84,6 +90,11 @@ fn main() -> std::io::Result<()> {
                     let client_fd = unsafe { libc::accept4(listen_fd, ptr::null_mut(), ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) };
                     if client_fd < 0 {
                         break;
+                    }
+                    unsafe {
+                        let one: libc::c_int = 1;
+                        libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+                        libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
                     }
                     let target_idx = rr % up_addrs.len();
                     batches[target_idx].push(client_fd);

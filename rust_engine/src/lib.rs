@@ -169,7 +169,7 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         SUPER_CHILDREN = children;
 
         // Warmup: Synthetic searches to train BPU and L3 Cache
-        let dummy_query = [0.0f32; 14];
+        let dummy_query = [0i16; 16];
         for _ in 0..1000 {
             search_vector(dummy_query.as_ptr(), 0);
         }
@@ -223,6 +223,28 @@ unsafe fn min_dist_to_bbox_avx2(q_vec: __m256i, bbox_ptr: *const i16, mask: __m2
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+unsafe fn dist_2_avx2_i16(q_vec: __m256i, b0_ptr: *const i16, b1_ptr: *const i16, mask: __m256i) -> (i32, i32) {
+    let b0 = _mm256_loadu_si256(b0_ptr as *const __m256i);
+    let b1 = _mm256_loadu_si256(b1_ptr as *const __m256i);
+    let diff0 = _mm256_sub_epi16(q_vec, b0);
+    let diff1 = _mm256_sub_epi16(q_vec, b1);
+    let masked0 = _mm256_and_si256(diff0, mask);
+    let masked1 = _mm256_and_si256(diff1, mask);
+    let sq0 = _mm256_madd_epi16(masked0, masked0);
+    let sq1 = _mm256_madd_epi16(masked1, masked1);
+
+    let h1 = _mm256_hadd_epi32(sq0, sq1);
+    let h2 = _mm256_hadd_epi32(h1, h1);
+    let lo = _mm256_castsi256_si128(h2);
+    let hi = _mm256_extracti128_si256(h2, 1);
+    let sum = _mm_add_epi32(lo, hi);
+    let d0 = _mm_cvtsi128_si32(sum);
+    let d1 = _mm_extract_epi32(sum, 1);
+    (d0, d1)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 unsafe fn min_dist_2_bboxes_avx2(
     q_vec: __m256i,
     b0_ptr: *const i16,
@@ -253,21 +275,15 @@ unsafe fn min_dist_2_bboxes_avx2(
     let sq0 = _mm256_madd_epi16(masked0, masked0);
     let sq1 = _mm256_madd_epi16(masked1, masked1);
 
-    let hi0 = _mm256_extracti128_si256(sq0, 1);
-    let lo0 = _mm256_castsi256_si128(sq0);
-    let hi1 = _mm256_extracti128_si256(sq1, 1);
-    let lo1 = _mm256_castsi256_si128(sq1);
+    let h1 = _mm256_hadd_epi32(sq0, sq1);
+    let h2 = _mm256_hadd_epi32(h1, h1);
+    let lo = _mm256_castsi256_si128(h2);
+    let hi = _mm256_extracti128_si256(h2, 1);
+    let sum = _mm_add_epi32(lo, hi);
+    let d0 = _mm_cvtsi128_si32(sum);
+    let d1 = _mm_extract_epi32(sum, 1);
 
-    let s0_1 = _mm_add_epi32(hi0, lo0);
-    let s1_1 = _mm_add_epi32(hi1, lo1);
-
-    let s0_2 = _mm_add_epi32(s0_1, _mm_shuffle_epi32(s0_1, 0x4E));
-    let s1_2 = _mm_add_epi32(s1_1, _mm_shuffle_epi32(s1_1, 0x4E));
-
-    let s0_3 = _mm_add_epi32(s0_2, _mm_shuffle_epi32(s0_2, 0xB1));
-    let s1_3 = _mm_add_epi32(s1_2, _mm_shuffle_epi32(s1_2, 0xB1));
-
-    (_mm_cvtsi128_si32(s0_3), _mm_cvtsi128_si32(s1_3))
+    (d0, d1)
 }
 
 #[inline(always)]
@@ -337,22 +353,13 @@ unsafe fn scan_cluster_aos(
                 let sq0 = _mm256_madd_epi16(masked0, masked0);
                 let sq1 = _mm256_madd_epi16(masked1, masked1);
 
-                let hi0 = _mm256_extracti128_si256(sq0, 1);
-                let lo0 = _mm256_castsi256_si128(sq0);
-                let hi1 = _mm256_extracti128_si256(sq1, 1);
-                let lo1 = _mm256_castsi256_si128(sq1);
-
-                let s0_1 = _mm_add_epi32(hi0, lo0);
-                let s1_1 = _mm_add_epi32(hi1, lo1);
-
-                let s0_2 = _mm_add_epi32(s0_1, _mm_shuffle_epi32(s0_1, 0x4E));
-                let s1_2 = _mm_add_epi32(s1_1, _mm_shuffle_epi32(s1_1, 0x4E));
-
-                let s0_3 = _mm_add_epi32(s0_2, _mm_shuffle_epi32(s0_2, 0xB1));
-                let s1_3 = _mm_add_epi32(s1_2, _mm_shuffle_epi32(s1_2, 0xB1));
-
-                let d0 = _mm_cvtsi128_si32(s0_3);
-                let d1 = _mm_cvtsi128_si32(s1_3);
+                let h1 = _mm256_hadd_epi32(sq0, sq1);
+                let h2 = _mm256_hadd_epi32(h1, h1);
+                let lo = _mm256_castsi256_si128(h2);
+                let hi = _mm256_extracti128_si256(h2, 1);
+                let sum = _mm_add_epi32(lo, hi);
+                let d0 = _mm_cvtsi128_si32(sum);
+                let d1 = _mm_extract_epi32(sum, 1);
 
                 if d0 < t_d[4] {
                     insert_top(d0, v_ptr, &mut t_d, &mut t_i, &mut t_l);
@@ -380,34 +387,40 @@ unsafe fn scan_cluster_aos(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn search_vector(query_ptr: *const f32, _force_deep: i32) -> i32 {
-    let q_in = slice::from_raw_parts(query_ptr, 14);
-    let mut q_i16 = [0i16; 16];
-    for i in 0..14 {
-        q_i16[i] = (q_in[i] * 10000.0).round() as i16;
-    }
-    
+pub unsafe extern "C" fn search_vector(query_ptr: *const i16, _force_deep: i32) -> i32 {
+    let q_vec = _mm256_loadu_si256(query_ptr as *const __m256i);
+    let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+
     let centroids = match CENTROIDS { Some(c) => c, None => return 0 };
     let bboxes = match BBOXES { Some(b) => b, None => return 0 };
     let mmap_ptr = match MMAP_PTR { Some(m) => m, None => return 0 };
     let offsets = match OFFSETS { Some(o) => o, None => return 0 };
     let num_blocks = match NUM_BLOCKS { Some(n) => n, None => return 0 };
 
-    let q_vec = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
-    let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
-
     let mut top_dists = [i32::MAX; 5];
     let mut top_indices = [0u32; 5];
     let mut top_labels = [0u32; 5];
 
-    // Pre-seed top_dists with the nearest centroid cluster
+    // Pre-seed top_dists with the nearest centroid cluster (unrolled 2x)
     let mut best_s = 0;
     let mut best_s_dist = i32::MAX;
-    for s in 0..91 {
-        let d = dist_avx2_i16(q_vec, SUPER_CENTROIDS[s].as_ptr(), mask);
+    let mut s_idx = 0;
+    while s_idx + 1 < 91 {
+        let (d0, d1) = dist_2_avx2_i16(q_vec, SUPER_CENTROIDS[s_idx].as_ptr(), SUPER_CENTROIDS[s_idx + 1].as_ptr(), mask);
+        if d0 < best_s_dist {
+            best_s_dist = d0;
+            best_s = s_idx;
+        }
+        if d1 < best_s_dist {
+            best_s_dist = d1;
+            best_s = s_idx + 1;
+        }
+        s_idx += 2;
+    }
+    if s_idx < 91 {
+        let d = dist_avx2_i16(q_vec, SUPER_CENTROIDS[s_idx].as_ptr(), mask);
         if d < best_s_dist {
-            best_s_dist = d;
-            best_s = s;
+            best_s = s_idx;
         }
     }
 
@@ -415,20 +428,37 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, _force_deep: i32) 
     let end_seed = SUPER_OFFSETS[best_s + 1] as usize;
     let mut best_ki = SUPER_CHILDREN[start_seed] as usize;
     let mut best_ki_dist = i32::MAX;
-    for i in start_seed..end_seed {
-        let ki = SUPER_CHILDREN[i] as usize;
+    let count_seed = end_seed - start_seed;
+    let mut ki_idx = 0;
+    while ki_idx + 1 < count_seed {
+        let ki0 = SUPER_CHILDREN[start_seed + ki_idx] as usize;
+        let ki1 = SUPER_CHILDREN[start_seed + ki_idx + 1] as usize;
+        let (d0, d1) = dist_2_avx2_i16(q_vec, centroids[ki0].as_ptr(), centroids[ki1].as_ptr(), mask);
+        if d0 < best_ki_dist {
+            best_ki_dist = d0;
+            best_ki = ki0;
+        }
+        if d1 < best_ki_dist {
+            best_ki_dist = d1;
+            best_ki = ki1;
+        }
+        ki_idx += 2;
+    }
+    if ki_idx < count_seed {
+        let ki = SUPER_CHILDREN[start_seed + ki_idx] as usize;
         let d = dist_avx2_i16(q_vec, centroids[ki].as_ptr(), mask);
         if d < best_ki_dist {
-            best_ki_dist = d;
             best_ki = ki;
         }
     }
 
     scan_cluster_aos(best_ki, q_vec, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels, mask);
 
-    let mut super_dists = [SuperDist { dist: 0, s: 0 }; 91];
     let zero = _mm256_setzero_si256();
     let mut s = 0;
+    let mut active_super = [SuperDist { dist: 0, s: 0 }; 91];
+    let mut num_active_super = 0;
+
     while s + 1 < 91 {
         let (d0, d1) = min_dist_2_bboxes_avx2(
             q_vec,
@@ -437,28 +467,40 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, _force_deep: i32) 
             mask,
             zero,
         );
-        super_dists[s] = SuperDist { dist: d0, s: s as u8 };
-        super_dists[s + 1] = SuperDist { dist: d1, s: (s + 1) as u8 };
+        if d0 < top_dists[4] {
+            active_super[num_active_super] = SuperDist { dist: d0, s: s as u8 };
+            num_active_super += 1;
+        }
+        if d1 < top_dists[4] {
+            active_super[num_active_super] = SuperDist { dist: d1, s: (s + 1) as u8 };
+            num_active_super += 1;
+        }
         s += 2;
     }
     if s < 91 {
-        super_dists[s] = SuperDist {
-            dist: min_dist_to_bbox_avx2(q_vec, SUPER_BBOXES[s].0.as_ptr(), mask),
-            s: s as u8,
-        };
+        let d = min_dist_to_bbox_avx2(q_vec, SUPER_BBOXES[s].0.as_ptr(), mask);
+        if d < top_dists[4] {
+            active_super[num_active_super] = SuperDist { dist: d, s: s as u8 };
+            num_active_super += 1;
+        }
     }
-    super_dists.sort_unstable_by_key(|e| e.dist);
 
-    let mut child_dists = [ChildDist { dist: 0, ki: 0 }; 256];
+    // Sort ONLY the active super bboxes (typically 1 to 4 instead of 91)
+    let super_sub = &mut active_super[0..num_active_super];
+    super_sub.sort_unstable_by_key(|e| e.dist);
 
-    for s in 0..91 {
-        if super_dists[s].dist >= top_dists[4] { break; } // Exact pruning at Super-BBox level
-        let s_idx = super_dists[s].s as usize;
+    let mut active_children = [ChildDist { dist: 0, ki: 0 }; 256];
+
+    for s_entry in super_sub {
+        if s_entry.dist >= top_dists[4] { break; }
+        let s_idx = s_entry.s as usize;
         
         let start = SUPER_OFFSETS[s_idx] as usize;
         let end = SUPER_OFFSETS[s_idx + 1] as usize;
         let count = end - start;
         let mut i = 0;
+        let mut num_active_children = 0;
+
         while i + 1 < count {
             let ki0 = SUPER_CHILDREN[start + i] as usize;
             let ki1 = SUPER_CHILDREN[start + i + 1] as usize;
@@ -469,25 +511,31 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, _force_deep: i32) 
                 mask,
                 zero,
             );
-            child_dists[i] = ChildDist { dist: d0, ki: ki0 as u16 };
-            child_dists[i + 1] = ChildDist { dist: d1, ki: ki1 as u16 };
+            if d0 < top_dists[4] {
+                active_children[num_active_children] = ChildDist { dist: d0, ki: ki0 as u16 };
+                num_active_children += 1;
+            }
+            if d1 < top_dists[4] {
+                active_children[num_active_children] = ChildDist { dist: d1, ki: ki1 as u16 };
+                num_active_children += 1;
+            }
             i += 2;
         }
         if i < count {
             let ki = SUPER_CHILDREN[start + i] as usize;
-            child_dists[i] = ChildDist {
-                dist: min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr(), mask),
-                ki: ki as u16,
-            };
+            let d = min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr(), mask);
+            if d < top_dists[4] {
+                active_children[num_active_children] = ChildDist { dist: d, ki: ki as u16 };
+                num_active_children += 1;
+            }
         }
         
-        // Sort children so we visit the closest BBoxes first, shrinking top_dists[4] ASAP!
-        let sub = &mut child_dists[0..count];
-        sub.sort_unstable_by_key(|e| e.dist);
+        let child_sub = &mut active_children[0..num_active_children];
+        child_sub.sort_unstable_by_key(|e| e.dist);
         
-        for i in 0..count {
-            if sub[i].dist >= top_dists[4] { break; } // Exact pruning at cluster BBox level
-            let ki = sub[i].ki as usize;
+        for ch in child_sub {
+            if ch.dist >= top_dists[4] { break; }
+            let ki = ch.ki as usize;
             if ki != best_ki {
                 scan_cluster_aos(ki, q_vec, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels, mask);
             }
