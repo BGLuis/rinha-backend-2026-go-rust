@@ -640,7 +640,7 @@ func main() {
 			continue
 		}
 		if n == 0 && err == nil {
-			for s := 0; s < 1200; s++ {
+			for s := 0; s < 500; s++ {
 				engine.Pause()
 				engine.Pause()
 				n, err = unix.EpollWait(epfd, events, 0)
@@ -679,7 +679,6 @@ func main() {
 					}
 
 					for _, client_fd := range fds {
-						unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 						unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
 
 						unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})

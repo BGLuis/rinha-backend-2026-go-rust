@@ -58,16 +58,10 @@ fn main() -> std::io::Result<()> {
     loop {
         let mut n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
         if n == 0 {
-            for _ in 0..300 {
-                unsafe {
-                    std::arch::x86_64::_mm_pause();
-                    std::arch::x86_64::_mm_pause();
-                }
-                n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
-                if n > 0 {
-                    break;
-                }
+            for _ in 0..128 {
+                unsafe { std::arch::x86_64::_mm_pause(); }
             }
+            n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
         }
         if n == 0 {
             n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, -1) };
