@@ -56,7 +56,16 @@ fn main() -> std::io::Result<()> {
     let mut batches: Vec<Vec<libc::c_int>> = vec![Vec::with_capacity(64); up_addrs.len()];
 
     loop {
-        let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, -1) };
+        let mut n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
+        if n == 0 {
+            for _ in 0..64 {
+                unsafe { std::arch::x86_64::_mm_pause(); }
+            }
+            n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, 0) };
+        }
+        if n == 0 {
+            n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1024, -1) };
+        }
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -76,11 +85,6 @@ fn main() -> std::io::Result<()> {
                     if client_fd < 0 {
                         break;
                     }
-                    unsafe {
-                        let one: libc::c_int = 1;
-                        libc::setsockopt(client_fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
-                    }
-
                     let target_idx = rr % up_addrs.len();
                     batches[target_idx].push(client_fd);
                     rr = rr.wrapping_add(1);
@@ -129,18 +133,20 @@ fn send_fds(sock: libc::c_int, addr: &libc::sockaddr_un, fds: &[libc::c_int]) {
 }
 
 fn create_listener(port: u16, backlog: i32) -> std::io::Result<RawFd> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
     let one: libc::c_int = 1;
+    let zero: libc::c_int = 0;
     unsafe {
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &zero as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
         libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &one as *const _ as *const libc::c_void, mem::size_of::<libc::c_int>() as libc::socklen_t);
-        let mut addr: libc::sockaddr_in = mem::zeroed();
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_port = port.to_be();
-        addr.sin_addr.s_addr = libc::INADDR_ANY.to_be();
-        if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_in>() as libc::socklen_t) < 0 {
+        let mut addr: libc::sockaddr_in6 = mem::zeroed();
+        addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        addr.sin6_port = port.to_be();
+        addr.sin6_addr = libc::in6addr_any;
+        if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t) < 0 {
             return Err(std::io::Error::last_os_error());
         }
         if libc::listen(fd, backlog) < 0 {

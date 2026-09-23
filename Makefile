@@ -1,4 +1,4 @@
-.PHONY: build up down restart restart-clean logs smoke test heavy-test test-precision test-thermal test-sustained test-saturation test-spike all-tests run-all docker-push-api docker-push-lb docker-push-all
+.PHONY: build up down restart restart-clean logs smoke test heavy-test test-precision test-thermal test-sustained test-saturation test-spike all-tests run-all docker-push-api docker-push-lb docker-push-all monitor test-monitored profile smoke-monitored
 
 DOCKER_COMPOSE = docker-compose
 K6_IMAGE = grafana/k6
@@ -27,6 +27,15 @@ restart-clean:
 
 logs:
 	$(DOCKER_COMPOSE) logs -f
+
+profile:
+	./scripts/monitor.sh
+
+test-monitored:
+	./scripts/monitor.sh
+
+smoke-monitored:
+	./scripts/monitor.sh "" smoke
 
 smoke:
 	docker-compose -f test/docker-compose.yml --profile smoke up

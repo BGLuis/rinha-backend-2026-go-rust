@@ -20,7 +20,7 @@ const fnCount = new Counter('fn_count');
 const errorCount = new Counter('error_count');
 
 export const options = {
-    summaryTrendStats: ['p(99)'],
+    summaryTrendStats: ['min', 'med', 'avg', 'p(90)', 'p(95)', 'p(99)', 'max'],
     systemTags: ['status', 'method'],
     dns: {
         ttl: '5m',
@@ -168,6 +168,6 @@ export function handleSummary(data) {
 
     return {
         'test/results.json': JSON.stringify(result, null, 2),
-        //stdout: textSummary(data, { indent: ' ', enableColors: true }),
+        stdout: textSummary(data, { indent: ' ', enableColors: true }),
     };
 }

@@ -19,7 +19,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -40,14 +39,16 @@ var (
 var MccRiskArr [10000]float32
 
 var (
-	resp0     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
-	resp1     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
-	resp2     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
-	resp3     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
-	resp4     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
-	resp5     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
-	resp404   = []byte("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
-	respReady = []byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+	resp0     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}")
+	resp1     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}")
+	resp2     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}")
+	resp3     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}")
+	resp4     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}")
+	resp5     = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
+	resp404   = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	respReady = []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+
+	resps = [6][]byte{resp0, resp1, resp2, resp3, resp4, resp5}
 )
 
 func loadConfig() {
@@ -279,43 +280,76 @@ func fastParseTimeStr(s []byte) int64 {
 }
 
 func fastVectorize(body []byte, q *[14]float32) {
-	amt := getValFloat(body, findDirect(body, keyAmount))
-	inst := getValInt(body, findDirect(body, keyInst))
-	reqAtBytes := getValString(body, findDirect(body, keyReqAt))
+	// 1. Transaction block
+	txStart := bytes.Index(body, keyTx)
+	var amt float64
+	var inst int64
+	var reqAtBytes []byte
+	if txStart != -1 {
+		txBlock := body[txStart:]
+		amt = getValFloat(txBlock, findDirect(txBlock, keyAmount))
+		inst = getValInt(txBlock, findDirect(txBlock, keyInst))
+		reqAtBytes = getValString(txBlock, findDirect(txBlock, keyReqAt))
+	}
 
-	cAvgAmt := getValFloat(body, findAfter(body, keyCust, keyAvgAmount))
-	txCount := getValInt(body, findDirect(body, keyTxCount))
-	
-	knownMerchStart := findDirect(body, keyKnownMerch)
+	// 2. Customer block
+	custStart := bytes.Index(body, keyCust)
+	var cAvgAmt float64
+	var txCount int64
 	var knownMerchBlock []byte
-	if knownMerchStart != -1 && knownMerchStart < len(body) && body[knownMerchStart] == '[' {
-		end := bytes.IndexByte(body[knownMerchStart:], ']')
-		if end != -1 {
-			knownMerchBlock = body[knownMerchStart : knownMerchStart+end+1]
+	if custStart != -1 {
+		custBlock := body[custStart:]
+		cAvgAmt = getValFloat(custBlock, findDirect(custBlock, keyAvgAmount))
+		txCount = getValInt(custBlock, findDirect(custBlock, keyTxCount))
+
+		knownMerchStart := findDirect(custBlock, keyKnownMerch)
+		if knownMerchStart != -1 && knownMerchStart < len(custBlock) && custBlock[knownMerchStart] == '[' {
+			end := bytes.IndexByte(custBlock[knownMerchStart:], ']')
+			if end != -1 {
+				knownMerchBlock = custBlock[knownMerchStart : knownMerchStart+end+1]
+			}
 		}
 	}
 
-	merchId := getValString(body, findAfter(body, keyMerch, keyId))
-	mccBytes := getValString(body, findDirect(body, keyMcc))
-	mAvgAmt := getValFloat(body, findAfter(body, keyMerch, keyAvgAmount))
+	// 3. Merchant block
+	merchStart := bytes.Index(body, keyMerch)
+	var merchId []byte
+	var mccBytes []byte
+	var mAvgAmt float64
+	if merchStart != -1 {
+		merchBlock := body[merchStart:]
+		merchId = getValString(merchBlock, findDirect(merchBlock, keyId))
+		mccBytes = getValString(merchBlock, findDirect(merchBlock, keyMcc))
+		mAvgAmt = getValFloat(merchBlock, findDirect(merchBlock, keyAvgAmount))
+	}
 
-	isOnline := getValBool(body, findDirect(body, keyIsOnline))
-	cardPresent := getValBool(body, findDirect(body, keyCardPres))
-	kmHome := getValFloat(body, findDirect(body, keyKmHome))
+	// 4. Terminal block
+	termStart := bytes.Index(body, keyTerm)
+	var isOnline bool
+	var cardPresent bool
+	var kmHome float64
+	if termStart != -1 {
+		termBlock := body[termStart:]
+		isOnline = getValBool(termBlock, findDirect(termBlock, keyIsOnline))
+		cardPresent = getValBool(termBlock, findDirect(termBlock, keyCardPres))
+		kmHome = getValFloat(termBlock, findDirect(termBlock, keyKmHome))
+	}
 
+	// 5. Last transaction block
 	var lastTsBytes []byte
 	var kmLast float64
 	hasLastTx := false
-	
+
 	lastTxStart := bytes.Index(body, keyLastTx)
 	if lastTxStart != -1 {
-		nullIdx := bytes.Index(body[lastTxStart:], []byte("null"))
-		timeStart := findAfter(body[lastTxStart:], keyLastTx, keyTimestamp)
-		
+		lastTxBlock := body[lastTxStart:]
+		nullIdx := bytes.Index(lastTxBlock, []byte("null"))
+		timeStart := findAfter(lastTxBlock, keyLastTx, keyTimestamp)
+
 		if timeStart != -1 && (nullIdx == -1 || timeStart < nullIdx) {
 			hasLastTx = true
-			lastTsBytes = getValString(body[lastTxStart:], timeStart)
-			kmLast = getValFloat(body[lastTxStart:], findAfter(body[lastTxStart:], keyLastTx, keyKmCurr))
+			lastTsBytes = getValString(lastTxBlock, timeStart)
+			kmLast = getValFloat(lastTxBlock, findAfter(lastTxBlock, keyLastTx, keyKmCurr))
 		}
 	}
 
@@ -390,7 +424,58 @@ func fastVectorize(body []byte, q *[14]float32) {
 	q[13] = clamp(mAvgAmt * MaxMerchantAvgAmount)
 }
 
-var reqCount uint64
+func writeResp(fd int, epfd int, resp []byte) bool {
+	_, err := unix.Write(fd, resp)
+	if err != nil {
+		unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+		unix.Close(fd)
+		return false
+	}
+	return true
+}
+
+func handleRequest(fd int, data []byte, q *[14]float32, scratch *[131072]byte, epfd int) {
+	var ok bool
+	var bodyIdx int = -1
+	if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
+		bodyIdx = bytes.Index(data, []byte("\r\n\r\n"))
+		if bodyIdx != -1 {
+			body := data[bodyIdx+4:]
+
+			fastVectorize(body, q)
+
+			frauds := engine.SearchVectorFast(&q[0], &scratch[0])
+
+			if uint32(frauds) <= 5 {
+				ok = writeResp(fd, epfd, resps[frauds])
+			} else {
+				ok = writeResp(fd, epfd, resp3)
+			}
+		} else {
+			ok = writeResp(fd, epfd, resp404)
+		}
+	} else if bytes.HasPrefix(data, []byte("GET /ready")) {
+		ok = writeResp(fd, epfd, respReady)
+	} else {
+		ok = writeResp(fd, epfd, resp404)
+	}
+
+	if !ok {
+		return
+	}
+
+	headerPart := data
+	if bodyIdx != -1 {
+		headerPart = data[:bodyIdx]
+	} else if idx := bytes.Index(data, []byte("\r\n\r\n")); idx != -1 {
+		headerPart = data[:idx]
+	}
+
+	if (bytes.IndexByte(headerPart, 'c') != -1 || bytes.IndexByte(headerPart, 'C') != -1) && bytes.Contains(headerPart, []byte("close")) {
+		unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
+		unix.Close(fd)
+	}
+}
 
 func main() {
 	runtime.GOMAXPROCS(1)
@@ -476,15 +561,6 @@ func main() {
 		log.Fatalf("epoll_ctl error: %v", err)
 	}
 
-	go func() {
-		for range time.Tick(10 * time.Second) {
-			count := atomic.SwapUint64(&reqCount, 0)
-			if count > 0 {
-				log.Printf("Throughput: %d req/10s", count)
-			}
-		}
-	}()
-
 	events := make([]unix.EpollEvent, 4096)
 	buf := make([]byte, 8192)
 	oob := make([]byte, unix.CmsgSpace(16*4))
@@ -494,11 +570,27 @@ func main() {
 	var globalScratch [131072]byte
 
 	for {
-		n, err := unix.EpollWait(epfd, events, -1)
-		if err != nil {
+		n, err := unix.EpollWait(epfd, events, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if n == 0 && err == nil {
+			for s := 0; s < 500; s++ {
+				engine.Pause()
+				engine.Pause()
+				n, err = unix.EpollWait(epfd, events, 0)
+				if n > 0 || err != nil {
+					break
+				}
+			}
+		}
+		if n == 0 && (err == nil || err == unix.EINTR) {
+			n, err = unix.EpollWait(epfd, events, -1)
 			if err == unix.EINTR {
 				continue
 			}
+		}
+		if err != nil {
 			log.Fatalf("epoll_wait error: %v", err)
 		}
 
@@ -506,22 +598,36 @@ func main() {
 			fd := int(events[i].Fd)
 
 			if fd == uds_fd {
-				// FD Passing
-				_, oobn, _, _, err := unix.Recvmsg(uds_fd, dummy, oob, 0)
-				if err != nil {
-					continue
-				}
-				msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
-				if err != nil || len(msgs) == 0 {
-					continue
-				}
-				fds, err := unix.ParseUnixRights(&msgs[0])
-				if err != nil || len(fds) == 0 {
-					continue
-				}
+				// Drain all pending FD batches from UDS
+				for {
+					_, oobn, _, _, err := unix.Recvmsg(uds_fd, dummy, oob, unix.MSG_DONTWAIT)
+					if err != nil {
+						break
+					}
+					msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+					if err != nil || len(msgs) == 0 {
+						break
+					}
+					fds, err := unix.ParseUnixRights(&msgs[0])
+					if err != nil || len(fds) == 0 {
+						break
+					}
 
-				for _, client_fd := range fds {
-					unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+					for _, client_fd := range fds {
+						unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
+						unix.SetsockoptInt(client_fd, unix.IPPROTO_TCP, unix.TCP_QUICKACK, 1)
+
+						unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, client_fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(client_fd)})
+
+						// Leitura inline imediata (com TCP_DEFER_ACCEPT o payload já está no buffer)
+						rn, err := unix.Read(client_fd, buf)
+						if rn > 0 {
+							handleRequest(client_fd, buf[:rn], &globalQuery, &globalScratch, epfd)
+						} else if err != nil && err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+							unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, client_fd, nil)
+							unix.Close(client_fd)
+						}
+					}
 				}
 				continue
 			}
@@ -542,45 +648,7 @@ func main() {
 				continue
 			}
 
-			atomic.AddUint64(&reqCount, 1)
-			data := buf[:rn]
-
-			if bytes.HasPrefix(data, []byte("GET /ready")) {
-				unix.Write(fd, respReady)
-			} else if bytes.HasPrefix(data, []byte("POST /fraud-score")) {
-				bodyIdx := bytes.Index(data, []byte("\r\n\r\n"))
-				if bodyIdx != -1 {
-					body := data[bodyIdx+4:]
-					
-					fastVectorize(body, &globalQuery)
-
-					frauds := engine.SearchVectorFast(&globalQuery[0], &globalScratch[0])
-
-					switch frauds {
-					case 0:
-						unix.Write(fd, resp0)
-					case 1:
-						unix.Write(fd, resp1)
-					case 2:
-						unix.Write(fd, resp2)
-					case 3:
-						unix.Write(fd, resp3)
-					case 4:
-						unix.Write(fd, resp4)
-					case 5:
-						unix.Write(fd, resp5)
-					default:
-						unix.Write(fd, resp3)
-					}
-				} else {
-					unix.Write(fd, resp404)
-				}
-			} else {
-				unix.Write(fd, resp404)
-			}
-
-			unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, fd, nil)
-			unix.Close(fd)
+			handleRequest(fd, buf[:rn], &globalQuery, &globalScratch, epfd)
 		}
 	}
 }

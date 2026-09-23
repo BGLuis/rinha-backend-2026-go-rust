@@ -22,3 +22,22 @@ TEXT ·SearchVectorFast(SB), NOSPLIT, $128-20
     // Return value from C function is in AX (int32)
     MOVL AX, ret+16(FP)
     RET
+
+TEXT ·Pause(SB), NOSPLIT, $0-0
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    PAUSE
+    RET

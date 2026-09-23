@@ -1,5 +1,6 @@
 # Build artifacts
 rust_engine/target/
+rust_lb/target/
 /bin/
 *.exe
 *.o
@@ -10,6 +11,7 @@ rinha-api
 dataset.bin
 clusters_tmp/
 cluster_*.bin
+*.log
 
 # OS files
 .DS_Store
@@ -24,3 +26,5 @@ Thumbs.db
 
 # Ignore results
 test/results.json
+test/results_precision.json
+

@@ -5,15 +5,34 @@ use std::slice;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[repr(align(64))]
+#[derive(Clone, Copy)]
+struct AlignedBBox([i16; 32]);
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct SuperDist {
+    dist: i32,
+    s: u8,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct ChildDist {
+    dist: i32,
+    ki: u16,
+}
+
 static mut MMAP_PTR: Option<*const u8> = None;
 static mut CENTROIDS: Option<&'static [[i16; 16]]> = None;
 static mut BBOXES: Option<&'static [[i16; 32]]> = None;
 static mut OFFSETS: Option<&'static [u32]> = None;
 static mut NUM_BLOCKS: Option<&'static [u32]> = None;
-static mut NUM_CLUSTERS: usize = 0;
 
-static mut SUPER_BBOXES: Option<Vec<[i16; 32]>> = None;
-static mut SUPER_INDEX: Option<Vec<Vec<usize>>> = None;
+static mut SUPER_CENTROIDS: [[i16; 16]; 91] = [[0; 16]; 91];
+static mut SUPER_BBOXES: [AlignedBBox; 91] = [AlignedBBox([0; 32]); 91];
+static mut SUPER_OFFSETS: [u16; 92] = [0; 92];
+static mut SUPER_CHILDREN: [u16; 4096] = [0; 4096];
 
 #[no_mangle]
 pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
@@ -47,11 +66,10 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
         if header[1] != 5 { return -6; } // expect version 5
 
         let k = header[2] as usize;
-        NUM_CLUSTERS = k;
+        assert_eq!(k, 4096, "Expected 4096 clusters");
 
         let centroids_ptr = ptr.add(64) as *const [i16; 16];
         let centroids = slice::from_raw_parts(centroids_ptr, k);
-        CENTROIDS = Some(centroids);
 
         let bboxes_ptr = ptr.add(64 + k * 32) as *const [i16; 32];
         BBOXES = Some(slice::from_raw_parts(bboxes_ptr, k));
@@ -71,6 +89,7 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
             super_centroids[i] = centroids[i * (k / num_super)];
         }
         
+        let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
         let mut assignment = vec![0; k];
         for _ in 0..5 {
             let mut sums = vec![[0i32; 16]; num_super];
@@ -80,7 +99,7 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
                 let mut best_s = 0;
                 let c_vec = _mm256_loadu_si256(centroids[i].as_ptr() as *const __m256i);
                 for s in 0..num_super {
-                    let d = dist_avx2_i16(c_vec, super_centroids[s].as_ptr());
+                    let d = dist_avx2_i16(c_vec, super_centroids[s].as_ptr(), mask);
                     if d < best_d {
                         best_d = d;
                         best_s = s;
@@ -101,29 +120,53 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
             }
         }
         
-        let mut super_index = vec![Vec::with_capacity(k / num_super * 2); num_super];
+        let mut counts = [0u16; 91];
         for i in 0..k {
-            super_index[assignment[i]].push(i);
-        }
-        
-        // Compute the EXACT Bounding Box for each Super-Centroid group
-        let bboxes = BBOXES.unwrap();
-        let mut super_bboxes = vec![[0i16; 32]; num_super];
-        for s in 0..num_super {
-            if super_index[s].is_empty() { continue; }
-            let first = super_index[s][0];
-            let mut s_bbox = bboxes[first];
-            for &idx in &super_index[s][1..] {
-                for j in 0..16 {
-                    s_bbox[j] = std::cmp::min(s_bbox[j], bboxes[idx][j]);
-                    s_bbox[j + 16] = std::cmp::max(s_bbox[j + 16], bboxes[idx][j + 16]);
-                }
-            }
-            super_bboxes[s] = s_bbox;
+            counts[assignment[i]] += 1;
         }
 
-        SUPER_BBOXES = Some(super_bboxes);
-        SUPER_INDEX = Some(super_index);
+        let mut offsets = [0u16; 92];
+        for s in 0..91 {
+            assert!(counts[s] <= 256, "Super cluster {} has {} children (> 256)", s, counts[s]);
+            offsets[s + 1] = offsets[s] + counts[s];
+        }
+
+        let mut cur_pos = offsets;
+        let mut children = [0u16; 4096];
+        for i in 0..k {
+            let s = assignment[i];
+            children[cur_pos[s] as usize] = i as u16;
+            cur_pos[s] += 1;
+        }
+
+        let bboxes = BBOXES.unwrap();
+        let mut super_bboxes = [AlignedBBox([0i16; 32]); 91];
+        for s in 0..91 {
+            let start = offsets[s] as usize;
+            let end = offsets[s + 1] as usize;
+            if start == end { continue; }
+            let first = children[start] as usize;
+            let mut s_bbox = bboxes[first];
+            for &idx in &children[start + 1..end] {
+                let ki = idx as usize;
+                for j in 0..16 {
+                    s_bbox[j] = std::cmp::min(s_bbox[j], bboxes[ki][j]);
+                    s_bbox[j + 16] = std::cmp::max(s_bbox[j + 16], bboxes[ki][j + 16]);
+                }
+            }
+            super_bboxes[s] = AlignedBBox(s_bbox);
+        }
+
+        CENTROIDS = Some(centroids);
+        let mut super_cent_arr = [[0i16; 16]; 91];
+        for s in 0..91 {
+            super_cent_arr[s] = super_centroids[s];
+        }
+        SUPER_CENTROIDS = super_cent_arr;
+
+        SUPER_BBOXES = super_bboxes;
+        SUPER_OFFSETS = offsets;
+        SUPER_CHILDREN = children;
 
         // Warmup: Synthetic searches to train BPU and L3 Cache
         let dummy_query = [0.0f32; 14];
@@ -137,25 +180,23 @@ pub extern "C" fn init_engine(path_ptr: *const c_char) -> i32 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn dist_avx2_i16(q_vec: __m256i, b_ptr: *const i16) -> i32 {
+unsafe fn dist_avx2_i16(q_vec: __m256i, b_ptr: *const i16, mask: __m256i) -> i32 {
     let b = _mm256_loadu_si256(b_ptr as *const __m256i);
     let diff = _mm256_sub_epi16(q_vec, b);
-    let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let masked_diff = _mm256_and_si256(diff, mask);
-    
     let sums = _mm256_madd_epi16(masked_diff, masked_diff);
     
-    let sum1 = _mm256_add_epi32(sums, _mm256_shuffle_epi32(sums, 0b01001110));
-    let sum2 = _mm256_add_epi32(sum1, _mm256_shuffle_epi32(sum1, 0b10110001));
-    let sum_low = _mm256_castsi256_si128(sum2);
-    let sum_high = _mm256_extracti128_si256(sum2, 1);
-    let sum3 = _mm_add_epi32(sum_low, sum_high);
-    _mm_cvtsi128_si32(sum3)
+    let hi128 = _mm256_extracti128_si256(sums, 1);
+    let lo128 = _mm256_castsi256_si128(sums);
+    let s1 = _mm_add_epi32(hi128, lo128);
+    let s2 = _mm_add_epi32(s1, _mm_shuffle_epi32(s1, 0x4E));
+    let s3 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xB1));
+    _mm_cvtsi128_si32(s3)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn min_dist_to_bbox_avx2(q_vec: __m256i, bbox_ptr: *const i16) -> i32 {
+unsafe fn min_dist_to_bbox_avx2(q_vec: __m256i, bbox_ptr: *const i16, mask: __m256i) -> i32 {
     let min_v = _mm256_loadu_si256(bbox_ptr as *const __m256i);
     let max_v = _mm256_loadu_si256((bbox_ptr.add(16)) as *const __m256i);
     
@@ -167,7 +208,6 @@ unsafe fn min_dist_to_bbox_avx2(q_vec: __m256i, bbox_ptr: *const i16) -> i32 {
     let p_max = _mm256_max_epi16(diff_max, zero);
     
     let diff = _mm256_or_si256(p_min, p_max);
-    let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
     let masked_diff = _mm256_and_si256(diff, mask);
     
     let sq = _mm256_madd_epi16(masked_diff, masked_diff);
@@ -181,17 +221,92 @@ unsafe fn min_dist_to_bbox_avx2(q_vec: __m256i, bbox_ptr: *const i16) -> i32 {
     _mm_cvtsi128_si32(s3)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn min_dist_2_bboxes_avx2(
+    q_vec: __m256i,
+    b0_ptr: *const i16,
+    b1_ptr: *const i16,
+    mask: __m256i,
+    zero: __m256i,
+) -> (i32, i32) {
+    let min0 = _mm256_loadu_si256(b0_ptr as *const __m256i);
+    let min1 = _mm256_loadu_si256(b1_ptr as *const __m256i);
+    let max0 = _mm256_loadu_si256((b0_ptr.add(16)) as *const __m256i);
+    let max1 = _mm256_loadu_si256((b1_ptr.add(16)) as *const __m256i);
+
+    let diff_min0 = _mm256_sub_epi16(min0, q_vec);
+    let diff_min1 = _mm256_sub_epi16(min1, q_vec);
+    let diff_max0 = _mm256_sub_epi16(q_vec, max0);
+    let diff_max1 = _mm256_sub_epi16(q_vec, max1);
+
+    let p_min0 = _mm256_max_epi16(diff_min0, zero);
+    let p_min1 = _mm256_max_epi16(diff_min1, zero);
+    let p_max0 = _mm256_max_epi16(diff_max0, zero);
+    let p_max1 = _mm256_max_epi16(diff_max1, zero);
+
+    let diff0 = _mm256_or_si256(p_min0, p_max0);
+    let diff1 = _mm256_or_si256(p_min1, p_max1);
+    let masked0 = _mm256_and_si256(diff0, mask);
+    let masked1 = _mm256_and_si256(diff1, mask);
+
+    let sq0 = _mm256_madd_epi16(masked0, masked0);
+    let sq1 = _mm256_madd_epi16(masked1, masked1);
+
+    let hi0 = _mm256_extracti128_si256(sq0, 1);
+    let lo0 = _mm256_castsi256_si128(sq0);
+    let hi1 = _mm256_extracti128_si256(sq1, 1);
+    let lo1 = _mm256_castsi256_si128(sq1);
+
+    let s0_1 = _mm_add_epi32(hi0, lo0);
+    let s1_1 = _mm_add_epi32(hi1, lo1);
+
+    let s0_2 = _mm_add_epi32(s0_1, _mm_shuffle_epi32(s0_1, 0x4E));
+    let s1_2 = _mm_add_epi32(s1_1, _mm_shuffle_epi32(s1_1, 0x4E));
+
+    let s0_3 = _mm_add_epi32(s0_2, _mm_shuffle_epi32(s0_2, 0xB1));
+    let s1_3 = _mm_add_epi32(s1_2, _mm_shuffle_epi32(s1_2, 0xB1));
+
+    (_mm_cvtsi128_si32(s0_3), _mm_cvtsi128_si32(s1_3))
+}
+
+#[inline(always)]
+unsafe fn insert_top(
+    d: i32,
+    v_ptr: *const i16,
+    t_d: &mut [i32; 5],
+    t_i: &mut [u32; 5],
+    t_l: &mut [u32; 5],
+) {
+    let meta = *(v_ptr.add(14) as *const u32);
+    let idx = meta & 0x7FFFFFFF;
+    let label = meta >> 31;
+
+    let mut k = 3;
+    while d < t_d[k] {
+        t_d[k + 1] = t_d[k];
+        t_i[k + 1] = t_i[k];
+        t_l[k + 1] = t_l[k];
+        if k == 0 { break; }
+        k -= 1;
+    }
+    let ins = if d < t_d[0] { 0 } else { k + 1 };
+    t_d[ins] = d;
+    t_i[ins] = idx;
+    t_l[ins] = label;
+}
+
 #[inline(always)]
 unsafe fn scan_cluster_aos(
     ki: usize,
     q_vec: __m256i,
-    q_i16: &[i16; 16],
     mmap_ptr: *const u8,
     offsets: &[u32],
     num_blocks: &[u32],
     top_dists: &mut [i32; 5],
     top_indices: &mut [u32; 5],
     top_labels: &mut [u32; 5],
+    mask: __m256i,
 ) {
     let offset = offsets[ki] as usize;
     let blocks_count = num_blocks[ki] as usize;
@@ -206,32 +321,54 @@ unsafe fn scan_cluster_aos(
         let num_vectors = *(ptr.add(64) as *const u32) as usize;
         ptr = ptr.add(96);
         
-        if min_dist_to_bbox_avx2(q_vec, bbox.as_ptr()) < t_d[4] {
+        if min_dist_to_bbox_avx2(q_vec, bbox.as_ptr(), mask) < t_d[4] {
             let mut v_ptr = ptr as *const i16;
-            for _ in 0..num_vectors {
-                let d = dist_avx2_i16(q_vec, v_ptr);
-                if d < t_d[4] {
-                    let m0 = *v_ptr.add(14) as u16 as u32;
-                    let m1 = *v_ptr.add(15) as u16 as u32;
-                    let meta = m0 | (m1 << 16);
-                    
-                    let idx = meta & 0x7FFFFFFF;
-                    let label = meta >> 31;
-                    
-                    let mut k = 3;
-                    while k >= 0 && d < t_d[k] {
-                        t_d[k + 1] = t_d[k];
-                        t_i[k + 1] = t_i[k];
-                        t_l[k + 1] = t_l[k];
-                        if k == 0 { break; }
-                        k -= 1;
-                    }
-                    let ins = if d < t_d[0] { 0 } else { k + 1 };
-                    t_d[ins] = d;
-                    t_i[ins] = idx;
-                    t_l[ins] = label;
+            let mut remaining = num_vectors;
+            while remaining >= 2 {
+                let b0 = _mm256_loadu_si256(v_ptr as *const __m256i);
+                let b1 = _mm256_loadu_si256(v_ptr.add(16) as *const __m256i);
+
+                let diff0 = _mm256_sub_epi16(q_vec, b0);
+                let diff1 = _mm256_sub_epi16(q_vec, b1);
+
+                let masked0 = _mm256_and_si256(diff0, mask);
+                let masked1 = _mm256_and_si256(diff1, mask);
+
+                let sq0 = _mm256_madd_epi16(masked0, masked0);
+                let sq1 = _mm256_madd_epi16(masked1, masked1);
+
+                let hi0 = _mm256_extracti128_si256(sq0, 1);
+                let lo0 = _mm256_castsi256_si128(sq0);
+                let hi1 = _mm256_extracti128_si256(sq1, 1);
+                let lo1 = _mm256_castsi256_si128(sq1);
+
+                let s0_1 = _mm_add_epi32(hi0, lo0);
+                let s1_1 = _mm_add_epi32(hi1, lo1);
+
+                let s0_2 = _mm_add_epi32(s0_1, _mm_shuffle_epi32(s0_1, 0x4E));
+                let s1_2 = _mm_add_epi32(s1_1, _mm_shuffle_epi32(s1_1, 0x4E));
+
+                let s0_3 = _mm_add_epi32(s0_2, _mm_shuffle_epi32(s0_2, 0xB1));
+                let s1_3 = _mm_add_epi32(s1_2, _mm_shuffle_epi32(s1_2, 0xB1));
+
+                let d0 = _mm_cvtsi128_si32(s0_3);
+                let d1 = _mm_cvtsi128_si32(s1_3);
+
+                if d0 < t_d[4] {
+                    insert_top(d0, v_ptr, &mut t_d, &mut t_i, &mut t_l);
                 }
-                v_ptr = v_ptr.add(16);
+                if d1 < t_d[4] {
+                    insert_top(d1, v_ptr.add(16), &mut t_d, &mut t_i, &mut t_l);
+                }
+
+                v_ptr = v_ptr.add(32);
+                remaining -= 2;
+            }
+            if remaining == 1 {
+                let d = dist_avx2_i16(q_vec, v_ptr, mask);
+                if d < t_d[4] {
+                    insert_top(d, v_ptr, &mut t_d, &mut t_i, &mut t_l);
+                }
             }
         }
         ptr = ptr.add(num_vectors * 32);
@@ -242,12 +379,8 @@ unsafe fn scan_cluster_aos(
     *top_labels = t_l;
 }
 
-static FEATURE_WEIGHTS: [f32; 16] = [
-    1.0038165, 0.665417, 0.8668326, 0.5379362, 0.5, 0.3, 0.3701757, 1.0, 1.2, 1.2648705, 0.81239825, 1.051987, 0.8247206, 2.0315619, 0.0, 0.0,
-];
-
 #[no_mangle]
-pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -> i32 {
+pub unsafe extern "C" fn search_vector(query_ptr: *const f32, _force_deep: i32) -> i32 {
     let q_in = slice::from_raw_parts(query_ptr, 14);
     let mut q_i16 = [0i16; 16];
     for i in 0..14 {
@@ -257,49 +390,107 @@ pub unsafe extern "C" fn search_vector(query_ptr: *const f32, force_deep: i32) -
     let centroids = match CENTROIDS { Some(c) => c, None => return 0 };
     let bboxes = match BBOXES { Some(b) => b, None => return 0 };
     let mmap_ptr = match MMAP_PTR { Some(m) => m, None => return 0 };
-    let offsets = OFFSETS.unwrap();
-    let num_blocks = NUM_BLOCKS.unwrap();
-    let num_k = NUM_CLUSTERS;
+    let offsets = match OFFSETS { Some(o) => o, None => return 0 };
+    let num_blocks = match NUM_BLOCKS { Some(n) => n, None => return 0 };
 
     let q_vec = _mm256_loadu_si256(q_i16.as_ptr() as *const __m256i);
-
-    let super_bboxes = SUPER_BBOXES.as_ref().unwrap();
-    let super_index = SUPER_INDEX.as_ref().unwrap();
-    let bboxes = BBOXES.unwrap();
-    let mmap_ptr = MMAP_PTR.unwrap();
-    let offsets = OFFSETS.unwrap();
-    let num_blocks = NUM_BLOCKS.unwrap();
+    let mask = _mm256_set_epi16(0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
 
     let mut top_dists = [i32::MAX; 5];
     let mut top_indices = [0u32; 5];
     let mut top_labels = [0u32; 5];
 
-    let mut super_dists = [(0i32, 0usize); 91];
+    // Pre-seed top_dists with the nearest centroid cluster
+    let mut best_s = 0;
+    let mut best_s_dist = i32::MAX;
     for s in 0..91 {
-        super_dists[s] = (min_dist_to_bbox_avx2(q_vec, super_bboxes[s].as_ptr()), s);
+        let d = dist_avx2_i16(q_vec, SUPER_CENTROIDS[s].as_ptr(), mask);
+        if d < best_s_dist {
+            best_s_dist = d;
+            best_s = s;
+        }
     }
-    super_dists.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let mut child_dists = [(0i32, 0usize); 4096]; // safely hold up to NUM_CLUSTERS
+    let start_seed = SUPER_OFFSETS[best_s] as usize;
+    let end_seed = SUPER_OFFSETS[best_s + 1] as usize;
+    let mut best_ki = SUPER_CHILDREN[start_seed] as usize;
+    let mut best_ki_dist = i32::MAX;
+    for i in start_seed..end_seed {
+        let ki = SUPER_CHILDREN[i] as usize;
+        let d = dist_avx2_i16(q_vec, centroids[ki].as_ptr(), mask);
+        if d < best_ki_dist {
+            best_ki_dist = d;
+            best_ki = ki;
+        }
+    }
+
+    scan_cluster_aos(best_ki, q_vec, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels, mask);
+
+    let mut super_dists = [SuperDist { dist: 0, s: 0 }; 91];
+    let zero = _mm256_setzero_si256();
+    let mut s = 0;
+    while s + 1 < 91 {
+        let (d0, d1) = min_dist_2_bboxes_avx2(
+            q_vec,
+            SUPER_BBOXES[s].0.as_ptr(),
+            SUPER_BBOXES[s + 1].0.as_ptr(),
+            mask,
+            zero,
+        );
+        super_dists[s] = SuperDist { dist: d0, s: s as u8 };
+        super_dists[s + 1] = SuperDist { dist: d1, s: (s + 1) as u8 };
+        s += 2;
+    }
+    if s < 91 {
+        super_dists[s] = SuperDist {
+            dist: min_dist_to_bbox_avx2(q_vec, SUPER_BBOXES[s].0.as_ptr(), mask),
+            s: s as u8,
+        };
+    }
+    super_dists.sort_unstable_by_key(|e| e.dist);
+
+    let mut child_dists = [ChildDist { dist: 0, ki: 0 }; 256];
 
     for s in 0..91 {
-        if super_dists[s].0 >= top_dists[4] { break; } // Exact pruning at Super-BBox level
-        let s_idx = super_dists[s].1;
+        if super_dists[s].dist >= top_dists[4] { break; } // Exact pruning at Super-BBox level
+        let s_idx = super_dists[s].s as usize;
         
-        let count = super_index[s_idx].len();
-        for i in 0..count {
-            let ki = super_index[s_idx][i];
-            child_dists[i] = (min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr()), ki);
+        let start = SUPER_OFFSETS[s_idx] as usize;
+        let end = SUPER_OFFSETS[s_idx + 1] as usize;
+        let count = end - start;
+        let mut i = 0;
+        while i + 1 < count {
+            let ki0 = SUPER_CHILDREN[start + i] as usize;
+            let ki1 = SUPER_CHILDREN[start + i + 1] as usize;
+            let (d0, d1) = min_dist_2_bboxes_avx2(
+                q_vec,
+                bboxes[ki0].as_ptr(),
+                bboxes[ki1].as_ptr(),
+                mask,
+                zero,
+            );
+            child_dists[i] = ChildDist { dist: d0, ki: ki0 as u16 };
+            child_dists[i + 1] = ChildDist { dist: d1, ki: ki1 as u16 };
+            i += 2;
+        }
+        if i < count {
+            let ki = SUPER_CHILDREN[start + i] as usize;
+            child_dists[i] = ChildDist {
+                dist: min_dist_to_bbox_avx2(q_vec, bboxes[ki].as_ptr(), mask),
+                ki: ki as u16,
+            };
         }
         
         // Sort children so we visit the closest BBoxes first, shrinking top_dists[4] ASAP!
         let sub = &mut child_dists[0..count];
-        sub.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        sub.sort_unstable_by_key(|e| e.dist);
         
         for i in 0..count {
-            if sub[i].0 >= top_dists[4] { break; } // Exact pruning at cluster BBox level
-            let ki = sub[i].1;
-            scan_cluster_aos(ki, q_vec, &q_i16, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels);
+            if sub[i].dist >= top_dists[4] { break; } // Exact pruning at cluster BBox level
+            let ki = sub[i].ki as usize;
+            if ki != best_ki {
+                scan_cluster_aos(ki, q_vec, mmap_ptr, offsets, num_blocks, &mut top_dists, &mut top_indices, &mut top_labels, mask);
+            }
         }
     }
 
